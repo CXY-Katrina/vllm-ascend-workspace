@@ -111,7 +111,7 @@ _CASES: list[tuple[str, set[str], set[str]]] = [
     (
         "KVQuantSparseAttnSharedKV",
         {"attention.sparse_sharedkv"},
-        {"attention.sparse_sharedkv.metadata", "attention.mla", "attention.gqa_or_mha"},
+        {"attention.sparse_sharedkv.metadata", "attention.mla", "attention.flash_score"},
     ),
     (
         "KVQuantSparseAttnSharedKVMetadata",
@@ -180,32 +180,82 @@ _CASES: list[tuple[str, set[str], set[str]]] = [
         {"attention.kvcomp.signpack"},
         set(),
     ),
-    (
-        "NpuReshapeAndCacheBnsd",
-        {"attention.kvcomp.cache_write"},
-        set(),
-    ),
-    # ---- Dense GQA / MHA
+    # NpuReshapeAndCacheBnsd is exercised down below (KVComp regression
+    # guard with explicit ``attention.kv_cache_io`` exclusion).
+    # ---- Dense flash-style score kernels (FIA / UnpadFA).
+    # Per the CANN docs (aclnnFusedInferAttentionScore[V2-V5]) and
+    # torch_npu.npu_fused_infer_attention_score, these support **MHA,
+    # GQA, AND MLA** via num_key_value_heads — the kernel category
+    # must therefore stay neutral (attention.flash_score) and must NOT
+    # bake in an architecture-specific label like the previous
+    # attention.gqa_or_mha. Architecture inference belongs in the
+    # resolver, not in the kernel name.
     (
         "FusedInferAttentionScore",
-        {"attention.gqa_or_mha"},
-        {"attention.mla", "attention.sparse_sharedkv"},
+        {"attention.flash_score"},
+        {"attention.mla", "attention.sparse_sharedkv", "attention.gqa_or_mha"},
     ),
     (
         "FusedInferAttentionScoreV2",
+        {"attention.flash_score"},
+        {"attention.mla", "attention.sparse_sharedkv", "attention.gqa_or_mha"},
+    ),
+    (
+        "FusedInferAttentionScoreV4",
+        {"attention.flash_score"},
         {"attention.gqa_or_mha"},
-        {"attention.mla", "attention.sparse_sharedkv"},
     ),
     (
         "UnpadFlashAttention",
+        {"attention.flash_score"},
         {"attention.gqa_or_mha"},
-        set(),
+    ),
+    # ATB-compiled bf16 variant of UnpadFlashAttention. Observed in
+    # GLM4.5-0919 and Qwen2.5-VL-7B traces; same role as the canonical
+    # name.
+    (
+        "UnpadFlashAttentionBF16NdKernel",
+        {"attention.flash_score"},
+        {"attention.gqa_or_mha", "attention.generic"},
+    ),
+    # ATB paged-attention score kernel (Qwen2.5-VL, GLM4.5-0919).
+    # Functionally equivalent to FIA — feeds the dense path's paged
+    # KV cache. Without this rule the resolver falls back to ``attn``.
+    (
+        "PagedAttentionMaskNdKernel",
+        {"attention.flash_score"},
+        {"attention.gqa_or_mha", "attention.generic", "attention.mla"},
     ),
     # ---- Linear / mamba / GDN
     (
         "CausalConv1d",
         {"attention.linear_or_mamba"},
-        {"attention.gqa_or_mha", "attention.mla", "attention.sparse_sharedkv"},
+        {"attention.flash_score", "attention.mla", "attention.sparse_sharedkv"},
+    ),
+    # Fix C: Qwen3-Next Gated DeltaNet causal 1D conv compiled by
+    # vllm-ascend (per-kernel ``_npu_tiled_0`` suffix). Same role as
+    # ``CausalConv1d`` above; pinned to make sure the longer token
+    # form still folds onto the ``causalconv1d`` substring.
+    (
+        "_causal_conv1d_update_kernel_npu_tiled_0",
+        {"attention.linear_or_mamba"},
+        {"attention.flash_score", "attention.mla", "attention.sparse_sharedkv"},
+    ),
+    # Fix C: GDN gating kernel (Z gate computation). Triggers the
+    # ``gdn`` substring rule.
+    (
+        "fused_gdn_gating_kernel_0",
+        {"attention.linear_or_mamba"},
+        {"attention.flash_score", "attention.mla", "attention.sparse_sharedkv"},
+    ),
+    # Fix C: GDN core recurrent rule kernel. Without an explicit
+    # ``recurrentgateddelta`` substring rule this kernel used to fall
+    # through entirely and never be tagged as attention, which broke
+    # layer-block decomposition for Qwen3-Next-style hybrid models.
+    (
+        "RecurrentGatedDeltaRule_85669048de2f4ae7785fd8d81b12f70b_0",
+        {"attention.linear_or_mamba"},
+        {"attention.flash_score", "attention.mla", "attention.sparse_sharedkv"},
     ),
     # ---- RoPE companions
     (
@@ -217,6 +267,107 @@ _CASES: list[tuple[str, set[str], set[str]]] = [
         "InPlacePartialRotaryMul",
         {"attention.rope.partial", "attention.rope"},
         {"attention.rope.interleave"},
+    ),
+    # MLA decode single-token rope (DSV3 trace).
+    (
+        "SingleRope",
+        {"attention.rope.partial", "attention.rope"},
+        {"attention.rope.interleave", "attention.rope.indexed"},
+    ),
+    # ATB / Triton generic RoPE variants — they all share the
+    # ``attention.rope`` umbrella; no architecture-specific sub-kind
+    # is inferred from name alone. Without these the layer-block
+    # decomposer can't anchor on the rope kernels surrounding the
+    # score op.
+    (
+        "RopeKernel",
+        {"attention.rope"},
+        {"attention.rope.interleave", "attention.rope.partial", "attention.rope.indexed"},
+    ),
+    (
+        "AtbRopeKernel",
+        {"attention.rope"},
+        {"attention.rope.interleave", "attention.rope.partial", "attention.rope.indexed"},
+    ),
+    (
+        "RopeWithSinCosCache_0_high_performance_20",
+        {"attention.rope"},
+        {"attention.rope.interleave", "attention.rope.partial"},
+    ),
+    (
+        "RotaryPosEmbInfer_2453a9de_high_performance_22",
+        {"attention.rope"},
+        {"attention.rope.interleave", "attention.rope.partial"},
+    ),
+    (
+        "rotary_pos_emb_22",
+        {"attention.rope"},
+        {"attention.rope.interleave", "attention.rope.partial"},
+    ),
+    (
+        "_triton_rope",
+        {"attention.rope"},
+        {"attention.rope.interleave", "attention.rope.partial"},
+    ),
+    # ---- MLA preprocessing variants (Triton / Ascend-C custom).
+    # Must reach attention.mla.kv_norm_rope_cache, exactly like
+    # KvRmsNormRopeCache, so the family resolver returns ``mla``.
+    (
+        "split_qkv_rmsnorm_rope_kernel",
+        {"attention.mla.kv_norm_rope_cache", "attention.rope"},
+        {"attention.sparse_sharedkv", "attention.flash_score"},
+    ),
+    (
+        "split_qkv_rmsnorm_rope_kernel_0",
+        {"attention.mla.kv_norm_rope_cache", "attention.rope"},
+        {"attention.sparse_sharedkv", "attention.flash_score"},
+    ),
+    # Fix C: ``fused_qkvzba_split_reshape_cat_kernel`` is the Qwen3-Next
+    # Gated DeltaNet QKV + Z (gate) + B (beta) + A (alpha) projection
+    # split. The ``zba`` suffix is GDN-specific and unrelated to the MLA
+    # ``splitqkvrmsnormrope`` companion. Previous releases (incorrectly)
+    # tagged it as ``attention.mla.kv_norm_rope_cache``, which made the
+    # family resolver pick ``mla`` for prof_311 (a hybrid GDN+MoE trace
+    # showing 1728 co-occurrences with causal_conv1d_update + fused_gdn
+    # _gating). The corrected tag is ``attention.linear_or_mamba``.
+    (
+        "fused_qkvzba_split_reshape_cat_kernel_0",
+        {"attention.linear_or_mamba"},
+        {"attention.mla.kv_norm_rope_cache", "attention.mla", "attention.flash_score"},
+    ),
+    # ---- Paged-KV cache I/O (plain dense / ATB path, NOT KVComp).
+    # Provides ``attention_aux`` role so layer-block decomposition
+    # treats them as attention companions instead of leaving them as
+    # untagged compute events.
+    (
+        "PagedCacheLoadNdKernel",
+        {"attention.kv_cache_io"},
+        {"attention.kvcomp.cache_write", "attention.mla.kv_norm_rope_cache"},
+    ),
+    (
+        "ScatterPaKvCache",
+        {"attention.kv_cache_io"},
+        {"attention.kvcomp.cache_write"},
+    ),
+    (
+        "ReshapeAndCacheNdKernel",
+        {"attention.kv_cache_io"},
+        {"attention.kvcomp.cache_write"},
+    ),
+    (
+        # vllm-ascend Triton naming. fold_text strips underscores so
+        # this folds to "reshapeandcache..." which is the substring we
+        # match on.
+        "reshape_and_cache_200000000",
+        {"attention.kv_cache_io"},
+        {"attention.kvcomp.cache_write"},
+    ),
+    # NpuReshapeAndCacheBnsd remains in the KVComp overlay (regression
+    # guard so the new generic rule doesn't shadow the BNSD variant).
+    (
+        "NpuReshapeAndCacheBnsd",
+        {"attention.kvcomp.cache_write"},
+        {"attention.kv_cache_io"},
     ),
     # ---- MoE gating top-k (the genuine fused op only)
     (
@@ -368,13 +519,20 @@ def test_exact_categories_for_fused_mc2_kernels(name, expected_categories, expec
 
 
 def test_deprecated_category_names_not_emitted_by_python() -> None:
-    """The earlier drafts coined two non-canonical name families:
-    ``attention.csa*`` (used as a generic catch-all) and ``attention.sfa*``
-    (used after a wrong subagent reading). Neither set may be emitted any
-    more — the kernel rule list now uses the paper-neutral names
-    (``attention.sparse_sharedkv``, ``attention.lightning_indexer``,
-    ``attention.kv_compressor``, …) and the paper-aligned architecture
-    family (``csa`` / ``dsa`` / …) is resolved at the report layer.
+    """The earlier drafts coined three non-canonical name families:
+
+    * ``attention.csa*``       — used as a generic catch-all.
+    * ``attention.sfa*``       — used after a wrong subagent reading.
+    * ``attention.gqa_or_mha`` — used as the kernel category for FIA /
+       UnpadFlashAttention, but baked an architecture-specific name
+       (GQA / MHA) into the kernel layer. CANN's FIA op explicitly
+       supports MHA / GQA / MLA via ``num_key_value_heads`` so the
+       kernel category is now the neutral ``attention.flash_score``.
+
+    None of these may be emitted any more — the kernel rule list uses
+    paper-neutral names; the paper-aligned architecture family
+    (``csa`` / ``dsa`` / … / ``gqa_or_mha``) is resolved at the report
+    layer from the *combination* of categories present in a block.
     """
     samples = [
         "KVQuantSparseAttnSharedKV",
@@ -384,12 +542,21 @@ def test_deprecated_category_names_not_emitted_by_python() -> None:
         "QuantLightningIndexer",
         "IndexerCompressEpilogV2",
         "BatchMatmulTranspose",
+        # Kernels that previously emitted attention.gqa_or_mha — they
+        # must now emit the neutral attention.flash_score instead.
+        "FusedInferAttentionScore",
+        "FusedInferAttentionScoreV2",
+        "FusedInferAttentionScoreV4",
+        "UnpadFlashAttention",
+        "FlashAttention",
+        "FlashAttentionScore",
     ]
     deprecated = {
         "attention.csa", "attention.csa.compressor", "attention.csa.indexer",
         "attention.csa.metadata",
         "attention.sfa", "attention.sfa.compressor", "attention.sfa.indexer",
         "attention.sfa.metadata", "attention.sfa.v_up_proj",
+        "attention.gqa_or_mha",
     }
     for name in samples:
         cats, _ = common.categories_and_roles(name, "", "")

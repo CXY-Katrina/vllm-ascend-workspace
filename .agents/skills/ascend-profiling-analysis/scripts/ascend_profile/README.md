@@ -195,7 +195,7 @@ Examples:
 
 | Raw implementation evidence | Abstract role |
 |---|---|
-| `FusedInferAttentionScore`, `UnpadFlashAttention`, flash attention variants | `attention.gqa_or_mha` |
+| `FusedInferAttentionScore`, `UnpadFlashAttention`, flash attention variants (CANN's FIA supports MHA / GQA / MLA via `num_key_value_heads`) | `attention.flash_score` |
 | MLA-like attention kernels (`MlaProlog` / `MlaPreprocess` / `KvRmsNormRopeCache`) | `attention.mla*` |
 | `KVQuantSparseAttnSharedKV` (sparse attention main kernel; DSA + CSA) | `attention.sparse_sharedkv` |
 | `LightningIndexer` (DSA + CSA top-k selector) | `attention.lightning_indexer` |

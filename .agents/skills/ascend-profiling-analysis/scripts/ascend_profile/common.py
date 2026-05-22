@@ -866,6 +866,21 @@ def categories_and_roles(name: str, task_type: str, accelerator_core: str) -> tu
         categories.add("attention.mla.kv_norm_rope_cache")
         categories.add("attention.rope")
         roles.add("attention_aux")
+    # Triton / Ascend-C MLA preprocessing variants observed in real
+    # traces (DSV2-Lite W8A8 path, GLM4.7). These kernels fuse the
+    # qkv split + rmsnorm + rope into a single custom op and serve
+    # the same role as KvRmsNormRopeCache on the MLA pipeline.
+    # Mirror of ``splitqkvrmsnormrope`` in kernel_signatures.yaml.
+    #
+    # NOTE: ``fused_qkvzba_split_reshape_cat_kernel`` (folded
+    # ``fusedqkvzbasplitreshape``) used to live here but it is
+    # NOT an MLA kernel — the ``zba`` suffix is GDN's gate (Z),
+    # beta (B) and alpha (A) parameters. It is handled below
+    # under the linear/mamba block instead.
+    if "splitqkvrmsnormrope" in text:
+        categories.add("attention.mla.kv_norm_rope_cache")
+        categories.add("attention.rope")
+        roles.add("attention_aux")
     if "transposebatchmatmul" in text or "transposequantbatchmatmul" in text:
         # MLA V up-proj uses npu_transpose_batchmatmul (mla_v1.py:893).
         categories.add("attention.mla.v_up_proj")
@@ -884,13 +899,70 @@ def categories_and_roles(name: str, task_type: str, accelerator_core: str) -> tu
         categories.add("attention.kvcomp.cache_write")
         roles.add("attention_aux")
 
+    # --- Attention: plain paged-KV cache I/O (dense / ATB path; NOT the
+    #     KVComp overlay above). MUST run after the bnsd variant so the
+    #     KVComp cache_write keeps its specific category; only the
+    #     non-bnsd variants land here. ``fold_text`` strips underscores
+    #     so "reshape_and_cache_200000000" reduces to "reshapeandcache..."
+    #     and falls through the same "reshapeandcache" substring rule.
+    if "attention.kvcomp.cache_write" not in categories and any(token in text for token in (
+        "pagedcacheload",
+        "scatterpakvcache",
+        "reshapeandcache",
+    )):
+        categories.add("attention.kv_cache_io")
+        roles.add("attention_aux")
+
     # --- Attention: dense GQA / MHA ---------------------------------------
-    if any(token in text for token in ("fusedinferattentionscore", "unpadflashattention", "flashattentionscore", "flashattention")):
-        categories.add("attention.gqa_or_mha")
+    # FIA / UnpadFA / ATB PagedAttentionMask all serve the same role —
+    # they are dense flash-style score kernels. The ATB variant uses a
+    # different name (``PagedAttentionMaskNdKernel``) but feeds the
+    # same paged KV cache and supports the same MHA/GQA distinction.
+    if any(token in text for token in (
+        "fusedinferattentionscore",
+        "unpadflashattention",
+        "flashattentionscore",
+        "flashattention",
+        "pagedattentionmask",
+    )):
+        # ``FusedInferAttentionScore`` (FIA) and ``UnpadFlashAttention``
+        # are general-purpose flash-style score kernels — per the CANN
+        # docs (aclnnFusedInferAttentionScore* / torch_npu
+        # .npu_fused_infer_attention_score), they support **MHA, GQA,
+        # AND MLA** depending on the ``num_key_value_heads`` parameter:
+        #   * num_kv == num_q              → MHA
+        #   * 1 < num_kv < num_q           → GQA
+        #   * num_kv == 1 (or per latent)  → MLA / MQA-style
+        # The kernel category therefore stays neutral
+        # (``attention.flash_score``); the architecture family is
+        # decided by the *combination* of category signatures present
+        # in a block (see resolve_attention_family).
+        categories.add("attention.flash_score")
         roles.add("attention")
 
     # --- Attention: linear / mamba / GDN ----------------------------------
-    if any(token in text for token in ("causalconv", "causalconv1d", "mamba", "deltanet", "gdn")):
+    # Tokens cover the full GDN/Mamba/DeltaNet kernel family observed
+    # on Ascend traces:
+    #   * ``causalconv`` / ``causalconv1d`` — Mamba/GDN causal 1D conv
+    #   * ``mamba`` / ``deltanet`` / ``gdn`` — Mamba2, DeltaNet, Gated DeltaNet hints
+    #   * ``recurrentgateddelta`` / ``recurrentdelta`` — GDN's recurrent rule kernel
+    #     (e.g. ``RecurrentGatedDeltaRule_*`` from Qwen3-Next).
+    #   * ``qkvzbasplit`` (folded form of ``qkvzba_split``) — Qwen3-Next
+    #     GDN QKV + Z (gate) + B (beta) + A (alpha) projection split.
+    #     Used to be mis-tagged as ``attention.mla.kv_norm_rope_cache``
+    #     because the bare ``fusedqkvzbasplitreshape`` token resembled
+    #     the MLA ``splitqkvrmsnormrope`` companion; the ``zba`` marker
+    #     is unique to GDN and must drive the linear family instead.
+    if any(token in text for token in (
+        "causalconv",
+        "causalconv1d",
+        "mamba",
+        "deltanet",
+        "gdn",
+        "recurrentgateddelta",
+        "recurrentdelta",
+        "qkvzbasplit",
+    )):
         categories.add("attention.linear_or_mamba")
         roles.add("attention")
 
@@ -904,8 +976,32 @@ def categories_and_roles(name: str, task_type: str, accelerator_core: str) -> tu
         categories.add("attention.rope.partial")
         categories.add("attention.rope")
         roles.add("attention_aux")
+    if "singlerope" in text:
+        # MLA decode single-token rope (mla_v1.py rope_single).
+        # Equivalent companion role to InplacePartialRotaryMul.
+        categories.add("attention.rope.partial")
+        categories.add("attention.rope")
+        roles.add("attention_aux")
     if "rotaryembedding" in text and "interleaverope" not in text:
         categories.add("attention.rope.indexed")
+        categories.add("attention.rope")
+        roles.add("attention_aux")
+    # ATB / Triton rope fallback: catches RopeKernel, AtbRopeKernel,
+    # RopeWithSinCosCache_*, RotaryPosEmbInfer_*, RotaryPositionEmbedding,
+    # rotary_pos_emb_*, _triton_rope, and similar variants. Runs AFTER
+    # the specific rules above so RotaryMul / InterleaveRope /
+    # SingleRope / NpuRotaryEmbedding keep their refined subtypes; only
+    # kernels that still have NO ``attention.rope`` get the umbrella
+    # tag (no sub-kind inferred).
+    if (
+        ("rope" in text or "rotary" in text)
+        and "attention.rope" not in categories
+        # exclude the MLA preprocessing kernel that already received
+        # attention.mla.kv_norm_rope_cache + attention.rope above
+        and "kvrmsnormropecache" not in text
+        and "splitqkvrmsnormrope" not in text
+        and "fusedqkvzbasplitreshape" not in text
+    ):
         categories.add("attention.rope")
         roles.add("attention_aux")
 
@@ -1043,29 +1139,41 @@ def categories_and_roles(name: str, task_type: str, accelerator_core: str) -> tu
 #
 # Returns one of the paper-aligned family names:
 #
-#   * ``csa``    — DeepSeek-V4 main layers (Compressed Sparse Attention)
-#   * ``hca``    — DeepSeek-V4 alternating layers (Heavily Compressed
-#                  Attention; heuristic)
-#   * ``dsa``    — DeepSeek-V3.2 (DeepSeek Sparse Attention, arxiv
-#                  2512.02556)
-#   * ``mla``    — DeepSeek-V2 / V3 (Multi-head Latent Attention)
-#   * ``linear`` — Mamba / GDN / linear attention
-#   * ``gqa``    — dense GQA / MHA via FIA (Llama / Qwen / Mistral …);
-#                  also covers vllm-ascend's ``UnpadFlashAttention``
-#                  which is part of ``AscendAttentionBackend`` (dense
-#                  path), NOT a separate FA backend.
-#   * ``attn``   — unknown / unclassified
+#   * ``csa``         — DeepSeek-V4 main layers (Compressed Sparse Attention)
+#   * ``hca``         — DeepSeek-V4 alternating layers (Heavily Compressed
+#                       Attention; heuristic)
+#   * ``dsa``         — DeepSeek-V3.2 (DeepSeek Sparse Attention, arxiv
+#                       2512.02556)
+#   * ``mla``         — DeepSeek-V2 / V3 (Multi-head Latent Attention)
+#   * ``linear``      — Mamba / GDN / linear attention
+#   * ``gqa_or_mha``  — dense flash-style attention via FIA /
+#                       UnpadFlashAttention. Both kernels support
+#                       MHA *and* GQA via the ``num_key_value_heads``
+#                       parameter. This resolver function looks at
+#                       *categories only* and therefore can't pick
+#                       between MHA and GQA; it returns the umbrella
+#                       ``gqa_or_mha``. A best-effort downstream step
+#                       (``refine_dense_attention_from_shapes``) reads
+#                       the Q/K Input Shapes recorded in
+#                       ``kernel_details.csv`` and refines this to
+#                       ``mha`` / ``gqa`` / ``mqa`` when shapes are
+#                       available and pass sanity checks. The
+#                       refinement is a heuristic — when shapes are
+#                       missing or ambiguous, the report keeps the
+#                       umbrella ``gqa_or_mha``.
+#   * ``attn``        — unknown / unclassified
 #
 # An ``+kvc`` suffix is appended if the Hamming-distance KV-compression
 # overlay is active (decode-only opt-in).
 #
-# Note on ``fa`` family: previous drafts emitted ``fa`` for any kernel
-# whose name contained ``flashattention``. That created a contract
-# mismatch with ``kernel_signatures.yaml`` which maps
-# ``UnpadFlashAttention`` to ``attention.gqa_or_mha`` (since it's the
-# long-context branch of the dense ``AscendAttentionBackend``, not a
-# distinct FA backend). The category-driven resolver here returns
-# ``gqa`` for that case, eliminating the divergence flagged in PR review.
+# Why ``attention.flash_score`` is neutral (not ``attention.gqa_or_mha``):
+# the underlying CANN op
+# (``aclnnFusedInferAttentionScore*`` / ``npu_fused_infer_attention_score``)
+# is documented to handle MHA, GQA, AND MLA via parameter configuration.
+# Naming the *kernel* category after one specific architecture would
+# leak architecture inference into the kernel layer; we keep the kernel
+# category neutral and resolve the architecture from the *combination*
+# of categories present in a block.
 
 _MLA_CATEGORIES = frozenset((
     "attention.mla",
@@ -1073,6 +1181,229 @@ _MLA_CATEGORIES = frozenset((
     "attention.mla.kv_norm_rope_cache",
     "attention.mla.v_up_proj",
 ))
+
+# Sanity-check guard for shape parsing: the last axis of Q/K tensors fed
+# to FIA / UnpadFlashAttention is the per-head dim. If we accidentally
+# pick up a mask, position table, or scale tensor, the "last axis" will
+# rarely fall in this set, so we drop the candidate. Values cover the
+# range seen across vLLM-Ascend supported models (dense path); MLA
+# layers carry their own NoPE+RoPE concat head_dim values (192 / 576)
+# but are resolved earlier in the decision order, so they don't reach
+# the dense refinement path.
+_VALID_HEAD_DIMS = frozenset({
+    16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 224, 256,
+    320, 384, 448, 512, 576, 640, 768, 1024,
+})
+
+# vLLM model attention heads are within this range (sanity check).
+_MAX_NUM_HEADS = 1024
+
+# Names recognised as dense flash-attention score kernels for shape-based
+# refinement. Keep in sync with the rule in ``categories_and_roles`` that
+# emits ``attention.flash_score``.
+#
+# NOTE: The ATB ``pagedattention`` kernels also feed the dense flash-score
+# path on Ascend (qwen25vl, glm45_0919, qwen25vl7b uses *both* this kernel
+# AND ``UnpadFlashAttentionBF16NdKernel``). They were previously omitted
+# from the token list which caused the shape-refinement pass to skip every
+# qwen25vl/glm-0919 event silently. The refinement still returns the
+# umbrella ``gqa_or_mha`` for paged-K layouts because num_kv_heads is not
+# directly recoverable from the cache shape, but at least the events are
+# now considered and the cases that DO carry non-paged shapes (UnpadFA
+# prefill) can refine to mha / gqa / mqa.
+_FLASH_SCORE_NAME_TOKENS = (
+    "fusedinferattentionscore",
+    "unpadflashattention",
+    "flashattentionscore",
+    "flashattention",
+    "pagedattentionmask",
+    "pagedattention",
+)
+
+
+def _parse_shape_token(token: str) -> list[int] | None:
+    """Parse one CANN ``Input Shapes`` token into a list of positive
+    integers. Returns ``None`` when the token is empty, malformed, or
+    contains non-positive dims (which would mean a placeholder /
+    optional input).
+    """
+    s = token.strip().strip('"').strip()
+    if not s or s in ("()", "[]"):
+        return None
+    s = s.strip("()[]")
+    parts = re.split(r"[,;\s]+", s)
+    dims: list[int] = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            return None
+        if value <= 0:
+            return None
+        dims.append(value)
+    return dims or None
+
+
+# When K is a 3D paged-KV-cache tensor ``[num_blocks, block_size, head_dim]``
+# the original num_kv_heads has been folded into ``num_blocks * block_size``
+# and we cannot recover it from shape alone. Heuristic: if K[0] is much
+# larger than Q[0] we likely picked up a paged-cache K (e.g. Q=[4, 4, 256]
+# vs K=[10000, 128, 256] on decode). The threshold below is conservative
+# enough that batched-tokens Q vs concatenated-tokens K don't trip it
+# (e.g. Q=[1620, 4, 128] vs K=[1620, 4, 128] passes).
+_PAGED_K_BATCH_RATIO_GUARD = 8
+
+
+def _qk_head_counts_from_input_shapes(
+    input_shapes: Sequence[str],
+) -> tuple[int, int] | None:
+    """Pull ``(num_q_heads, num_kv_heads)`` from the first two valid
+    Q/K tensors in a CANN ``Input Shapes`` list.
+
+    The CANN ABI for both ``aclnnFusedInferAttentionScore[V2-V5]`` and
+    ``UnpadFlashAttention`` puts ``query`` at input[0] and ``key`` at
+    input[1]; we scan forward until we find two tensors whose last axis
+    is a plausible per-head dim, then read the second-to-last axis as
+    the head count. Returns ``None`` if the shapes don't satisfy the
+    dense flash-attention invariant.
+
+    Supported Q/K layouts:
+      * 3D batch-major: ``[total_tokens, num_heads, head_dim]``
+        (FIA prefill, UnpadFA non-paged).
+      * 4D batched:     ``[B, S, num_heads, head_dim]``.
+
+    Refuses to read:
+      * 3D paged K-cache ``[num_blocks, block_size, head_dim]`` — here
+        the second-to-last axis is ``block_size``, NOT ``num_kv_heads``;
+        ``num_kv_heads`` has been folded into ``num_blocks * block_size``
+        and is not directly recoverable. Detected via K[0] >> Q[0].
+      * 5D+ tensors (unknown layout).
+    """
+    candidates: list[tuple[int, int, list[int]]] = []  # (num_heads, head_dim, dims)
+    for token in input_shapes:
+        dims = _parse_shape_token(token)
+        if dims is None or len(dims) < 3 or len(dims) > 4:
+            continue
+        head_dim = dims[-1]
+        num_heads = dims[-2]
+        if head_dim not in _VALID_HEAD_DIMS:
+            continue
+        if num_heads < 1 or num_heads > _MAX_NUM_HEADS:
+            continue
+        candidates.append((num_heads, head_dim, dims))
+        if len(candidates) >= 2:
+            break
+    if len(candidates) < 2:
+        return None
+    (num_q, head_dim_q, dims_q), (num_kv, head_dim_k, dims_k) = (
+        candidates[0],
+        candidates[1],
+    )
+    if head_dim_q != head_dim_k:
+        # Q and K must share head_dim on FIA / UnpadFA — mismatch means
+        # we latched onto the wrong tensor (mask / pse / etc).
+        return None
+    # Paged-K guard (decode direction): if both Q and K are 3D and K[0]
+    # is much larger than Q[0], K is almost certainly a paged-cache
+    # layout where the second-to-last axis is ``block_size``, not
+    # ``num_kv_heads``. Bail out so we don't emit a wrong refinement.
+    if (
+        len(dims_q) == 3
+        and len(dims_k) == 3
+        and dims_q[0] > 0
+        and dims_k[0] >= dims_q[0] * _PAGED_K_BATCH_RATIO_GUARD
+    ):
+        return None
+    # Paged-K guard (prefill direction): in prefill mode Q carries the
+    # total query token count and K is the paged cache. Q[0] can easily
+    # exceed K[0] (e.g. Q=[32768,8,256], K=[1950,128,256] from nextprof),
+    # so the decode-direction guard above doesn't fire. However, the
+    # cache's second-to-last axis (which the loop reads as
+    # ``num_kv_heads``) is really the block_size and is therefore much
+    # larger than the true number of KV heads — and in real
+    # MHA / GQA / MQA the invariant ``num_kv_heads <= num_q_heads``
+    # always holds. So whenever the candidate Q/K pair violates that
+    # invariant we are looking at a paged layout (or worse, the wrong
+    # tensor) and must bail out instead of emitting a bogus refinement.
+    if num_kv > num_q:
+        return None
+    return num_q, num_kv
+
+
+def _split_cann_shapes_field(value: str) -> list[str]:
+    """Replicates ``html_report._split_semi`` here so ``common.py`` stays
+    independent of the report module. CANN ``Input Shapes`` is a
+    ``;``-separated list; the cell may be quoted to escape inner ``;``.
+    """
+    if not value:
+        return []
+    v = value.strip()
+    while len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+        v = v[1:-1]
+        if not v:
+            break
+    if not v:
+        return []
+    return [tok.strip() for tok in v.split(';')]
+
+
+def refine_dense_attention_from_shapes(events: Iterable[Any]) -> str:
+    """Best-effort upgrade of the terminal ``gqa_or_mha`` family label
+    to ``mha`` / ``gqa`` / ``mqa`` using shapes recorded in
+    ``kernel_details.csv:Input Shapes`` for FIA / UnpadFA events.
+
+    Returns one of ``{'mha', 'gqa', 'mqa', 'gqa_or_mha'}``. The last
+    value means refinement was not possible (shapes missing, malformed,
+    or events disagreed without a clear majority); in that case the
+    caller should keep the ``gqa_or_mha`` terminal label.
+
+    **Best-effort, NOT a contract.** The skill does not read HF
+    ``config.json``; this heuristic relies on the CANN profiler
+    serialising the Q/K Input Shapes in the kernel_details row. That
+    field can be missing or quirky after aclgraph compilation, so
+    treat the refined sub-kind as an annotation, not a guarantee.
+
+    Decision rules:
+      * ``num_q_heads == num_kv_heads``                            → ``mha``
+      * ``num_kv_heads == 1``  AND ``num_q_heads > 1``             → ``mqa``
+      * ``num_q_heads > num_kv_heads`` AND ratio divides evenly    → ``gqa``
+      * non-integer ratio, or shapes failed the sanity checks      → no vote
+      * disagreement without a clear majority across events        → ``gqa_or_mha``
+    """
+    votes: dict[str, int] = {"mha": 0, "gqa": 0, "mqa": 0}
+    for event in events:
+        raw_name = getattr(event, "name", "") or ""
+        text = raw_name.lower()
+        if not any(token in text for token in _FLASH_SCORE_NAME_TOKENS):
+            continue
+        raw = getattr(event, "raw_row", None) or {}
+        shapes_value = raw.get("Input Shapes") or raw.get("Input Shape") or ""
+        if not shapes_value:
+            continue
+        tokens = _split_cann_shapes_field(str(shapes_value))
+        head_counts = _qk_head_counts_from_input_shapes(tokens)
+        if head_counts is None:
+            continue
+        num_q, num_kv = head_counts
+        if num_q == num_kv and num_q >= 1:
+            votes["mha"] += 1
+        elif num_kv == 1 and num_q > 1:
+            votes["mqa"] += 1
+        elif num_q > num_kv and num_q % num_kv == 0:
+            votes["gqa"] += 1
+        # else: silent skip — odd ratios are usually parsing slip-ups
+
+    total = sum(votes.values())
+    if total == 0:
+        return "gqa_or_mha"
+    winner, score = max(votes.items(), key=lambda kv: kv[1])
+    # Require an outright majority (not just plurality) so that a
+    # ambiguous mix doesn't get a spuriously confident label.
+    if score * 2 <= total:
+        return "gqa_or_mha"
+    return winner
 
 
 def resolve_attention_family(categories: Iterable[str]) -> str:
@@ -1090,14 +1421,14 @@ def resolve_attention_family(categories: Iterable[str]) -> str:
     # NOTE: ``attention.sparse_sharedkv.metadata`` is deliberately not
     # treated as evidence of the main sparse signature — a metadata-only
     # block must not classify as DSA / CSA.
-    has_dense_fia = "attention.gqa_or_mha" in cats
+    has_flash_score = "attention.flash_score" in cats
     has_mla_marker = bool(_MLA_CATEGORIES & cats)
 
     if has_compressor and has_indexer and has_sparse_sharedkv:
         base = "csa"
     elif (
         has_compressor
-        and has_dense_fia
+        and has_flash_score
         and not has_indexer
         and not has_sparse_sharedkv
     ):
@@ -1107,11 +1438,26 @@ def resolve_attention_family(categories: Iterable[str]) -> str:
     elif has_mla_marker and not (
         has_compressor or has_indexer or has_sparse_sharedkv
     ):
+        # MLA-architected layer. The flash_score kernel may or may not
+        # be present (MLA decode reuses FIA for the score step); either
+        # way the MLA-specific companions (MlaProlog / KvRmsNormRopeCache
+        # / MLA V-up-proj) take precedence over the bare flash_score
+        # signal.
         base = "mla"
     elif "attention.linear_or_mamba" in cats:
         base = "linear"
-    elif has_dense_fia:
-        base = "gqa"
+    elif has_flash_score:
+        # Dense flash-style umbrella label. FIA / UnpadFlashAttention
+        # without any architecture-specific companion. From categories
+        # alone we can't pick between MHA / GQA / MQA, so the resolver
+        # returns the umbrella ``gqa_or_mha``. The caller (currently
+        # ``html_report.detect_attention_subtype``) may then invoke
+        # ``refine_dense_attention_from_shapes`` to upgrade this to
+        # ``mha`` / ``gqa`` / ``mqa`` using the Q/K Input Shapes
+        # recorded in ``kernel_details.csv``. That refinement step is
+        # best-effort — when shapes are missing or fail sanity checks
+        # the label stays ``gqa_or_mha``.
+        base = "gqa_or_mha"
     else:
         base = "attn"
 

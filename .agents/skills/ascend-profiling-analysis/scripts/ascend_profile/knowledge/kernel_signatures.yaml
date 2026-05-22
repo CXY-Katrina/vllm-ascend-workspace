@@ -12,7 +12,7 @@ version: 1
 # single kernel name.
 #
 # Naming policy:
-#   * Architecture/paper names (mla / dsa / csa / hca / gqa) are only used
+#   * Architecture/paper names (mla / dsa / csa / hca / gqa_or_mha) are only used
 #     at the family-resolution layer (see attention_families.yaml and
 #     html_report.detect_attention_subtype).
 #   * Kernel categories below are descriptive: ``attention.kv_compressor``,
@@ -41,26 +41,72 @@ schema_notes:
 # ----------------------------------------------------------------------------
 kernels:
 
-  # ---- Dense attention (GQA / MHA): shared by MLA decode, DSA / CSA fallback,
-  #      and the plain AscendAttentionBackend.
+  # ---- Flash-style score kernels: FIA / UnpadFlashAttention.
+  #      These are general-purpose dense flash-attention score kernels.
+  #      Per the CANN docs
+  #      (aclnnFusedInferAttentionScore[V2-V5], torch_npu.npu_fused_infer_attention_score),
+  #      the same op supports **MHA, GQA, AND MLA** depending on the
+  #      ``num_key_value_heads`` parameter:
+  #        * num_kv == num_q              → MHA
+  #        * 1 < num_kv < num_q           → GQA
+  #        * num_kv == 1 (or per latent)  → MLA / MQA-style
+  #      The kernel category therefore stays neutral
+  #      (``attention.flash_score``); the architecture family is
+  #      decided downstream from the *combination* of category
+  #      signatures present in a block (see attention_families.yaml).
   - profile_name: fusedinferattentionscore
-    aliases: [fusedinferattentionscorev2, fia, fiav2]
-    python_entry: torch_npu.npu_fused_infer_attention_score[_v2]
-    categories: [attention.gqa_or_mha]
+    aliases: [fusedinferattentionscorev2, fusedinferattentionscorev3, fusedinferattentionscorev4, fia, fiav2]
+    python_entry: torch_npu.npu_fused_infer_attention_score[_v2/_v3/_v4]
+    categories: [attention.flash_score]
     roles: [attention]
-    used_by_family: [mla, dsa, hca, gqa]
+    used_by_family: [mla, dsa, hca, gqa_or_mha]
     evidence:
+      - "CANN docs aclnnFusedInferAttentionScoreV4 — explicit MHA / GQA / MLA support
+        via num_key_value_heads"
       - "vllm-ascend/vllm_ascend/attention/attention_v1.py — dense path"
       - "vllm-ascend/vllm_ascend/attention/mla_v1.py:1524 — MLA decode score"
 
   - profile_name: unpadflashattention
-    aliases: [flashattention, flashattentionscore]
+    aliases: [flashattention, flashattentionscore, unpadflashattentionbf16ndkernel]
     python_entry: torch_npu.npu_flash_attention*
-    categories: [attention.gqa_or_mha]
+    categories: [attention.flash_score]
     roles: [attention]
-    used_by_family: [gqa, fa]
+    used_by_family: [mla, gqa_or_mha]
     evidence:
-      - "vllm-ascend/vllm_ascend/attention/attention_v1.py — long-context / prefill"
+      - "vllm-ascend/vllm_ascend/attention/attention_v1.py — long-context / prefill;
+        same dense AscendAttentionBackend, NOT a separate FA backend"
+      - "ATB stack: UnpadFlashAttentionBF16NdKernel = ATB-compiled
+        bf16 variant of the same dense flash-score op (observed in
+        GLM4.5-0919 / Qwen2.5-VL traces)"
+    notes: |
+      Earlier drafts labelled this kernel as GQA-only. That was wrong:
+      ``UnpadFlashAttention`` is the long-context branch of the dense
+      ``AscendAttentionBackend`` and, like FIA, supports MHA / GQA via
+      the standard ``num_key_value_heads`` configuration.
+
+  # ATB (Ascend Transformer Boost) paged-attention score kernel. The
+  # mask-pattern suffix (``MaskNd``) just records the mask layout; the
+  # kernel itself is the ATB equivalent of FIA — dense flash-style
+  # score op feeding a paged KV cache. CANN docs alias:
+  # ``atb_paged_attention_mask`` (closed-source op).
+  - profile_name: pagedattentionmask
+    aliases: [pagedattentionmaskndkernel]
+    python_entry: |
+      ATB compiled op (closed-source). Equivalent to FIA in the dense
+      AscendAttentionBackend path — selected when ATB acceleration is on
+      and the runtime carries a precomputed attention mask.
+    categories: [attention.flash_score]
+    roles: [attention]
+    used_by_family: [gqa_or_mha]
+    evidence:
+      - "ATB op_list (Ascend Transformer Boost) paged_attention_mask"
+      - "Observed in Qwen2.5-VL and GLM4.5-0919 vllm-ascend traces (PR #50 follow-up)"
+    notes: |
+      ATB-compiled paged-FA score op. Treated as the same kernel
+      category as FIA / UnpadFlashAttention so the family resolver
+      reaches ``gqa_or_mha`` (or its shape-refined sub-kinds) instead
+      of falling back to ``attn``. The shape signal is recorded in
+      ``kernel_details.csv:Input Shapes`` the same way FIA records it.
 
   # ---- MLA (DeepSeek V2 / V3, also reused by DSA in V3.2 paper section 4.x)
   #      CANN canonical op names (per the CANN op_list and the PR that added
@@ -213,6 +259,38 @@ kernels:
     evidence:
       - "vllm-ascend/vllm_ascend/attention/kvcomp_attn/attention_utils.py:87"
 
+  # Plain paged-attention KV cache I/O (dense / ATB path; NOT the KVComp
+  # Hamming-distance overlay above). The ATB stack ships several
+  # variants and the vllm-ascend Triton stack adds reshape_and_cache_*
+  # for non-BNSD layouts. They all share the same role: read or write
+  # the paged KV cache around the score kernel.
+  #
+  # Distinction from KVComp:
+  #   * ``reshape_and_cache_bnsd``    → KVComp overlay (BNSD layout, decode)
+  #   * ``reshape_and_cache`` (other) → plain dense path  (this entry)
+  - profile_name: pagedcacheio
+    aliases:
+      - pagedcacheloadndkernel
+      - scatterpakvcache
+      - reshapeandcachendkernel
+      - reshapeandcache
+    python_entry: |
+      ATB compiled paged-KV cache ops (closed-source) and the
+      vllm-ascend Triton reshape_and_cache_* kernels.
+    categories: [attention.kv_cache_io]
+    roles: [attention_aux]
+    used_by_family: [mla, dsa, csa, gqa_or_mha]
+    evidence:
+      - "transfer/qwen25vl: ReshapeAndCacheNdKernel (8000x in 100k events)"
+      - "transfer/glm45 / glm450919: ReshapeAndCacheNdKernel"
+      - "transfer/dsv3bad: PagedCacheLoadNdKernel + ScatterPaKvCache (ATB MLA)"
+      - "transfer DSV2-Lite: reshape_and_cache_200000000 (Triton)"
+    notes: |
+      The Python rule MUST run *after* the more specific
+      ``reshape_and_cache_bnsd`` rule above so the KVComp variant
+      stays under ``attention.kvcomp.cache_write`` and only the
+      plain cache ops fall into ``attention.kv_cache_io``.
+
   # ---- Linear / Mamba / GatedDeltaNet
   - profile_name: causalconv1d
     aliases: [causalconv]
@@ -222,6 +300,7 @@ kernels:
     used_by_family: [linear]
     evidence:
       - "common.py — preserved substring rule"
+      - "transfer/prof_311: _causal_conv1d_update_kernel_npu_tiled_0 (1728x)"
 
   - profile_name: mamba
     aliases: [deltanet, gdn]
@@ -229,6 +308,34 @@ kernels:
     categories: [attention.linear_or_mamba]
     roles: [attention]
     used_by_family: [linear]
+    evidence:
+      - "transfer/prof_311: fused_gdn_gating_kernel_0 (1728x)"
+
+  - profile_name: recurrentgateddeltarule
+    aliases: [recurrentdelta, recurrentgateddelta]
+    python_entry: |
+      Gated DeltaNet recurrent compute kernel (Qwen3-Next family).
+    categories: [attention.linear_or_mamba]
+    roles: [attention]
+    used_by_family: [linear]
+    evidence:
+      - "transfer/prof_311: RecurrentGatedDeltaRule_* (Qwen3-Next GDN attention)"
+
+  - profile_name: fusedqkvzbasplitreshape
+    aliases: [qkvzbasplit, fusedqkvzba]
+    python_entry: |
+      Qwen3-Next Gated DeltaNet fused QKV + Z (gate) + B (beta)
+      + A (alpha) split & reshape kernel. The ``zba`` markers are
+      GDN's recurrence parameters, not MLA companions. Previous
+      versions mis-tagged this kernel as
+      ``attention.mla.kv_norm_rope_cache`` because the bare
+      ``fusedqkvzbasplitreshape`` token resembled the MLA
+      ``splitqkvrmsnormrope`` kernel — corrected since Fix C.
+    categories: [attention.linear_or_mamba]
+    roles: [attention]
+    used_by_family: [linear]
+    evidence:
+      - "transfer/prof_311: fused_qkvzba_split_reshape_cat_kernel_0 (1728x co-occurring with causal_conv1d_update and fused_gdn_gating)"
 
 # ----------------------------------------------------------------------------
 # Attention companions: RoPE / KV-cache write / normalisation around attention
@@ -248,7 +355,7 @@ kernels:
     python_entry: torch_npu.npu_rotary_mul
     categories: [attention.rope, attention.rope.partial]
     roles: [attention_aux]
-    used_by_family: [mla, dsa, csa, gqa]
+    used_by_family: [mla, dsa, csa, gqa_or_mha]
     evidence:
       - "vllm-ascend/vllm_ascend/attention/sfa_v1.py:937"
       - "vllm-ascend/vllm_ascend/attention/sfa_v1.py:977"
@@ -258,9 +365,50 @@ kernels:
     python_entry: torch_npu._npu_rotary_embedding
     categories: [attention.rope, attention.rope.indexed]
     roles: [attention_aux]
-    used_by_family: [gqa]
+    used_by_family: [gqa_or_mha]
     evidence:
       - "vllm-ascend/vllm_ascend/ops/rotary_embedding.py:189"
+
+  # ATB / Triton generic RoPE kernels. The ATB stack ships several
+  # variants with different naming conventions, and vllm-ascend's
+  # Triton stack adds more (rotary_pos_emb_*, _triton_rope, etc.).
+  # They all serve the same companion role — apply rotary position
+  # encoding to Q/K — and the dense / MLA family is decided by the
+  # surrounding score / preprocess kernels.
+  #
+  # The Python rule mirroring this entry is a *positional fallback*
+  # that fires only when none of the specific RoPE rules above (
+  # InterleaveRope / RotaryMul / NpuRotaryEmbedding / SingleRope)
+  # matched. Order matters in common.py.
+  - profile_name: rope_generic
+    aliases:
+      - ropekernel
+      - atbropekernel
+      - ropewithsincoscache
+      - rotaryposembinfer
+      - rotarypositionembedding
+      - rotaryposemb
+      - tritonrope
+    python_entry: |
+      ATB rope kernels (closed-source) and Triton-emitted rope kernels
+      in vllm-ascend. Examples observed in real traces:
+        - RopeKernel, AtbRopeKernel (ATB)
+        - RopeWithSinCosCache_0_high_performance_20 (Triton)
+        - RotaryPosEmbInfer_<hash>_high_performance_22 (Triton)
+        - RotaryPositionEmbedding (ATB / generic)
+        - rotary_pos_emb_22 (Triton numbered variant)
+        - _triton_rope (vllm-ascend MLA Triton path)
+    categories: [attention.rope]
+    roles: [attention_aux]
+    used_by_family: [gqa_or_mha, mla, dsa, csa]
+    evidence:
+      - "transfer/glm45, transfer/glm450919, transfer/qwen25vl,
+        transfer/prof_311, transfer/nextprof traces"
+    notes: |
+      No architecture-family discriminator on its own — only adds
+      ``attention.rope`` so the layer-block decomposer treats it as
+      an attention companion. Resolved family is decided by the
+      *score / preprocess* kernel in the same block.
 
   - profile_name: kvrmsnormropecache
     python_entry: torch_npu.npu_kv_rmsnorm_rope_cache
@@ -273,6 +421,58 @@ kernels:
       Fuses KV RMSNorm + RoPE + paged-attention cache write. MLA-family
       signature; never appears in plain GQA paths. DSA and CSA inherit it
       via the SFA backend reusing MLA's KV pipeline.
+
+  # Triton / Ascend-C custom MLA preprocessing kernels. They take the
+  # fused projection output and produce the latent KV + RoPE tensors
+  # consumed by the MLA score path, exactly like KvRmsNormRopeCache
+  # but compiled as a single split + rmsnorm + rope kernel. Observed
+  # in:
+  #   * DeepSeek-V2-Lite (split_qkv_rmsnorm_rope_kernel; W8A8 path)
+  #   * GLM4.7 (split_qkv_rmsnorm_rope_kernel; "GlmMoeDsaForCausalLM"
+  #     marketing label, impl is MLA per attention_families.yaml)
+  #
+  # NOTE: ``fused_qkvzba_split_reshape_cat_kernel`` was previously
+  # listed here as an alias because the bare token resembles the MLA
+  # ``splitqkvrmsnormrope`` kernel — but the ``zba`` suffix encodes
+  # the GDN gate (Z) / beta (B) / alpha (A) parameters and the kernel
+  # is the Qwen3-Next Gated DeltaNet QKV projection split. It is now
+  # handled under ``profile_name: fusedqkvzbasplitreshape`` in the
+  # linear/mamba block above and tagged as ``attention.linear_or_mamba``.
+  - profile_name: splitqkvrmsnormrope
+    aliases: [splitqkvrmsnormropekernel]
+    python_entry: |
+      Triton / Ascend-C custom kernel registered by vllm-ascend in
+      mla_v1.py and the GLM/DSV2-Lite Triton stack. Equivalent to
+      KvRmsNormRopeCache for the MLA preprocessing stage (split +
+      rmsnorm + rope + cache write).
+    categories: [attention.mla.kv_norm_rope_cache, attention.rope]
+    roles: [attention_aux]
+    used_by_family: [mla, dsa, csa]
+    evidence:
+      - "transfer DSV2-Lite trace (W8A8 quant path)"
+      - "transfer GLM4.7 trace (paired with FusedInferAttentionScore)"
+    notes: |
+      Treated as MLA preprocessing — same category as
+      KvRmsNormRopeCache — so the family resolver reaches ``mla``
+      (or ``dsa`` when sparse companions are also present) instead
+      of falling back to ``gqa_or_mha`` or ``attn``.
+
+  # Single-token rotary position embedding kernel emitted on the MLA
+  # decode path next to FIA (one RoPE per generated token). Treated as
+  # the same companion as InplacePartialRotaryMul.
+  - profile_name: singlerope
+    python_entry: |
+      vllm-ascend MLA decode single-token rope (mla_v1.py rope_single).
+      Equivalent role to npu_rotary_mul on the decode path.
+    categories: [attention.rope, attention.rope.partial]
+    roles: [attention_aux]
+    used_by_family: [mla, dsa, csa]
+    evidence:
+      - "transfer/dsv3 trace (paired with KvRmsNormRopeCache)"
+    notes: |
+      MLA decode path emits one SingleRope per layer per token. Not to
+      be confused with InterleaveRope (prefill) or InplacePartialRotaryMul
+      (partial-RoPE on quantised path).
 
   - profile_name: rmsnorm
     aliases: [addrmsnorm, addrmsnormbias, gemmarmsnorm]
@@ -493,3 +693,14 @@ deprecated_categories:
   attention.sfa.indexer:    attention.lightning_indexer
   attention.sfa.metadata:   attention.sparse_sharedkv.metadata
   attention.sfa.v_up_proj:  attention.sparse_attn.v_up_proj
+  # ``attention.gqa_or_mha`` was used as the kernel category for FIA /
+  # UnpadFlashAttention but baked an architecture inference into the
+  # kernel layer. CANN's FIA op
+  # (aclnnFusedInferAttentionScore[V2-V5]) explicitly supports MHA /
+  # GQA / MLA via ``num_key_value_heads``, so the kernel category is
+  # now ``attention.flash_score`` (neutral). The architecture family
+  # — the umbrella ``gqa_or_mha`` plus its shape-refined sub-kinds
+  # ``mha`` / ``gqa`` / ``mqa`` — lives in the resolver and shape-
+  # refinement helper (see common.resolve_attention_family and
+  # common.refine_dense_attention_from_shapes).
+  attention.gqa_or_mha:     attention.flash_score

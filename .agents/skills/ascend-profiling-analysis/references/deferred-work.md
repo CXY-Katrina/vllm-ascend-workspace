@@ -162,7 +162,27 @@ Open follow-ups:
   `manifest.json:input.root`, compare to current `--remote-profile-root`)
   would catch foot-guns.
 
-## 10. `ascend-profiling-anomaly` overlap
+## 10. `segment.py` exact-cover performance
+
+`validate_unresolved_composite_bodies` calls
+`sequence_occurrence_count(sequence, template)` for every plan/template
+pair. The inner loop is brute-force `O(n·m·|template|)` substring
+matching. On a dsv4 prefill rank (~3k complete plans × ~50 recurring
+templates × avg seq_len ~15) this is ~10-30 s, and the surrounding
+`exact_cover_sequence` memoized DP adds another large constant. The
+8-minute dsv4 prefill segment stage observed during the May 2026 sweep
+is plausibly dominated by this code path.
+
+A KMP-based occurrence counter (`O(n+m)` per pair) or pre-indexed
+template-anchor table (`O(n)` per plan, amortized) would remove the
+hot spot without changing semantics. Defer this until segmentation
+strategy externalization (§5b) lands, so the perf work and the rule
+restructuring touch `segment.py` together.
+
+Acceptance: dsv4 prefill segment stage finishes in < 60 s; existing
+unit tests in `tests/test_segment_validator.py` continue to pass.
+
+## 11. `ascend-profiling-anomaly` overlap
 
 The user-level `ascend-profiling-anomaly` skill (in `.claude/`) still
 operates on raw kernel_details for ad-hoc anomaly hunts. Once this

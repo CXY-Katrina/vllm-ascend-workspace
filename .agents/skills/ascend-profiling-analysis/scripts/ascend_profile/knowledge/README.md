@@ -17,7 +17,7 @@ analysis code; treat them as part of the contract.
 | `kernel_signatures.yaml` | Flat inventory: each profile kernel name → category labels + `evidence: path:line` in vllm / vllm-ascend. Authoritative source when adding a new kernel rule. | `common.categories_and_roles`, `tests/test_kernel_signatures.py` |
 | `attention_families.yaml` | MLA / SFA / KVComp / linear / dense families. Each family declares the **combination** of category signatures (must_have / must_not_have) that uniquely identifies it on Ascend; SFA is the in-code name for DeepSeek-V3.2 / V4 sparse attention (NOT "NSA" / "CSA"). | `common.categories_and_roles`, `html_report.detect_attention_subtype`, `tests/test_attention_families.py` |
 | `moe_families.yaml` | MC2 / fused MC2 / dense FFN families. Also explicitly documents that the HC* / MHC* prefix kernels (`HCPreSinkhorn`, `HCPreInvRMS`, `HCPost`, `MhcRmsNorm`) are **structural block-head helpers** that appear before BOTH attention and MoE blocks — they stay under `block_head.mhc_prefix` and must NOT be conflated with `moe.gating`. | `common.categories_and_roles`, `tests/test_moe_families.py` |
-| `model_architectures.yaml` | HF arch → (attention family, FFN family) high-level map. **Report-time annotation only**: not used to drive segmentation. Source for future `attention_family_mismatch` diagnostic. | `report.py` annotation, future `diagnostics.py` |
+| `model_architectures.yaml` | HF arch → (attention family, FFN family) high-level map. **Static knowledge / documentation only.** This skill's input is `ascend_pt/` profiling output — never HF `config.json` — so the file is *not consumed at runtime* by any analysis stage. The report's "model structure" line (e.g. `27L · mla+moe`) is derived from observed kernel signatures via `html_report.guess_model_structure`, not from this YAML. Use it as a human reference table when reasoning about which kernel signatures *should* be seen for each architecture. | (none — documentation) |
 
 When adding a new knowledge file, register it in the table above and
 reference it from the analysis stage that consumes it.
@@ -46,10 +46,22 @@ can have multiple categories.  The full inventory lives in
 enum.  Headline categories:
 
 - attention (paper-neutral kernel labels; the architecture family —
-  `mla`, `dsa`, `csa`, `hca`, `gqa`, `linear`, `fa` — is resolved at
-  the report layer from the *combination* of categories present in
-  one block; see `attention_families.yaml`).
-  - `attention.gqa_or_mha`           — dense GQA / MHA path (Llama, Qwen, FIA)
+  `mla`, `dsa`, `csa`, `hca`, `gqa_or_mha` (+ shape-refined
+  `mha` / `gqa` / `mqa`), `linear` — is resolved at the report
+  layer. The base label comes from the *combination* of categories
+  present in one block (see `attention_families.yaml`); the
+  refinement of the `gqa_or_mha` umbrella into `mha` / `gqa` /
+  `mqa` is a best-effort heuristic over `Input Shapes`, see
+  `common.refine_dense_attention_from_shapes`.
+  - `attention.flash_score`          — dense flash-style score kernel
+                                       (`FusedInferAttentionScore[V*]`,
+                                       `UnpadFlashAttention`). Neutral
+                                       on purpose — per the CANN docs
+                                       these ops support MHA / GQA / MLA
+                                       via ``num_key_value_heads``;
+                                       architecture inference is the
+                                       resolver's job, not the kernel
+                                       label's.
   - `attention.mla`                  — MLA preprocess / decode marker (DSV2/V3, also reused by DSA)
   - `attention.mla.kv_norm_rope_cache` — `KvRmsNormRopeCache` fused op
   - `attention.mla.preprocess`       — `MlaProlog` / `MlaPrologV2` / `MlaPreprocess` (CANN canonical names)
@@ -100,7 +112,7 @@ as a generic catch-all) and `attention.sfa*` (used after a wrong
 subagent reading). **Neither is used anymore.** Sparse-attention
 kernels now live under the paper-neutral names listed above; the
 paper-aligned architecture family (`mla` / `dsa` / `csa` / `hca` /
-`gqa`) is resolved at the report layer, never baked into the kernel
+`gqa_or_mha`) is resolved at the report layer, never baked into the kernel
 category. See `kernel_signatures.yaml:deprecated_categories` for the
 migration map.
 
@@ -111,8 +123,13 @@ same role can be proven by different implementation evidence.
 
 Examples:
 
-- `gqa_attention_block`
-  - accepted evidence: `attention.gqa_or_mha`
+- `gqa_or_mha_attention_block` (umbrella; report may render as
+  `mha` / `gqa` / `mqa` when shape-refinement succeeds)
+  - accepted evidence: `attention.flash_score` only (no MLA / sparse markers)
+  - shape refinement: if FIA / UnpadFA `Input Shapes` are available and
+    Q/K head counts pass sanity checks, the block is reported with the
+    shape-refined sub-kind. Falls back to `gqa_or_mha` when shapes are
+    missing or ambiguous.
 - `moe_block`
   - accepted evidence: `moe.gating` plus one of `moe.dispatch_expert_compute`,
     `moe.dispatch + compute.matmul + moe.combine`
@@ -122,7 +139,7 @@ Examples:
     (`attention.mla.kv_norm_rope_cache`, `attention.mla.preprocess`) may also
     appear because the SFA backend reuses MLAPO at small token counts.
 - `hca_attention_block`  (DeepSeek-V4 alternating layers — Heavily Compressed Attention; heuristic)
-  - accepted evidence: `attention.kv_compressor` + `attention.gqa_or_mha`
+  - accepted evidence: `attention.kv_compressor` + `attention.flash_score`
     with NO `attention.lightning_indexer` and NO `attention.sparse_sharedkv`.
 - `dsa_attention_block`  (DeepSeek-V3.2 — DeepSeek Sparse Attention per arxiv 2512.02556)
   - accepted evidence: `attention.lightning_indexer` + `attention.sparse_sharedkv`
@@ -130,7 +147,8 @@ Examples:
     DSA is built on MLA in MQA mode (paper §4).
 - `mla_attention_block`  (DeepSeek-V2 / V3 — Multi-head Latent Attention)
   - accepted evidence: `attention.mla.kv_norm_rope_cache` plus
-    `attention.gqa_or_mha` (FIA[V2] still computes the score), without ANY
+    `attention.flash_score` (FIA still computes the MLA decode score,
+    invoked with ``num_key_value_heads = 1``), without ANY
     sparse-attention signature (`attention.kv_compressor`,
     `attention.lightning_indexer`, `attention.sparse_sharedkv`).
 - `block_head`
