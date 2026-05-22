@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import functools
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -369,6 +370,7 @@ def layer_regime_key(signature: str) -> str:
     return key
 
 
+@functools.lru_cache(maxsize=None)
 def layer_role_key(signature: str) -> str:
     terms = [
         term
@@ -1013,6 +1015,7 @@ def attention_terms(signature: str) -> tuple[str, ...]:
     return tuple(sorted(set(terms)))
 
 
+@functools.lru_cache(maxsize=None)
 def split_role_count(item: str) -> tuple[str, str]:
     match = re.fullmatch(r"(.+)x(\d+)", item)
     if match:
@@ -1478,6 +1481,7 @@ def strict_substructure(candidate: Sequence[str], reference: Sequence[str]) -> b
     return all(reference_counter[key] >= value for key, value in candidate_counter.items())
 
 
+@functools.lru_cache(maxsize=None)
 def core_role_key(signature: str) -> str:
     """Return the structural core without auxiliary implementation details."""
 
@@ -1507,6 +1511,7 @@ def frame_core_sequence(frame: LayerFrame) -> tuple[str, ...]:
     return tuple(core_role_key(layer.signature) for layer in frame.layers)
 
 
+@functools.lru_cache(maxsize=None)
 def layer_boundary_key(signature: str) -> str:
     """Return the stable sequence key used to prove step boundaries.
 
@@ -1609,46 +1614,59 @@ def piecewise_template_slice_cover(
     return None
 
 
-def core_components(signature: str) -> Counter[str]:
-    components: Counter[str] = Counter()
+@functools.lru_cache(maxsize=None)
+def _core_components_items(signature: str) -> tuple[tuple[str, int], ...]:
+    components: dict[str, int] = {}
     for term in core_role_key(signature).split("|"):
         if not term:
             continue
         role, _, values = term.partition(":")
         if not values:
-            components[role] += 1
+            components[role] = components.get(role, 0) + 1
             continue
         for item in values.split("+"):
             category, count = split_role_count(item)
             if category:
-                components[f"{role}:{category}"] += int(count or "1")
-    return components
+                key = f"{role}:{category}"
+                components[key] = components.get(key, 0) + int(count or "1")
+    return tuple(components.items())
+
+
+def core_components(signature: str) -> Counter[str]:
+    return Counter(dict(_core_components_items(signature)))
 
 
 def frame_core_components(frame: LayerFrame) -> Counter[str]:
     total: Counter[str] = Counter()
     for layer in frame.layers:
-        total.update(core_components(layer.signature))
+        for key, value in _core_components_items(layer.signature):
+            total[key] += value
     return total
 
 
-def coarse_core_components(signature: str) -> Counter[str]:
-    components: Counter[str] = Counter()
+@functools.lru_cache(maxsize=None)
+def _coarse_core_components_items(signature: str) -> tuple[tuple[str, int], ...]:
+    components: dict[str, int] = {}
     for term in core_role_key(signature).split("|"):
         if not term:
             continue
         role, _, values = term.partition(":")
         if not values:
-            components[role] += 1
+            components[role] = components.get(role, 0) + 1
             continue
-        components[role] += len([item for item in values.split("+") if item])
-    return components
+        components[role] = components.get(role, 0) + sum(1 for item in values.split("+") if item)
+    return tuple(components.items())
+
+
+def coarse_core_components(signature: str) -> Counter[str]:
+    return Counter(dict(_coarse_core_components_items(signature)))
 
 
 def frame_coarse_core_components(frame: LayerFrame) -> Counter[str]:
     total: Counter[str] = Counter()
     for layer in frame.layers:
-        total.update(coarse_core_components(layer.signature))
+        for key, value in _coarse_core_components_items(layer.signature):
+            total[key] += value
     return total
 
 
@@ -1807,9 +1825,82 @@ def plan_piecewise_template_cover(plan: StepPlan, templates: Sequence[tuple[str,
     )
 
 
+def _layers_subset_of_template_layers(
+    layers: Sequence[LayerObservation],
+    template_layer_term_sets: Sequence[frozenset[str]],
+) -> bool:
+    """Return True iff every layer's term set is a subset of *some*
+    layer term set drawn from a recurring template.
+
+    The check fires on the union of ``core_role_key`` and
+    ``layer_boundary_key`` terms so it works for residuals that drop the
+    attention half of a layer (boundary path) as well as residuals that
+    drop the MoE/FFN half (core-role path).
+    """
+
+    if not template_layer_term_sets:
+        return False
+    for layer in layers:
+        layer_terms = frozenset(
+            part
+            for part in (
+                set(core_role_key(layer.signature).split("|"))
+                | set(layer_boundary_key(layer.signature).split("|"))
+            )
+            if part
+        )
+        if not layer_terms:
+            return False
+        if not any(
+            layer_terms <= template_terms for template_terms in template_layer_term_sets
+        ):
+            return False
+    return True
+
+
 def classify_residual_plans(plans: Sequence[StepPlan]) -> list[StepPlan]:
     recurring_templates = recurring_boundary_templates_from_plans(
         tuple(plan for plan in plans if not plan_is_template_residual(plan))
+    )
+    # Build the set of layer-term-sets seen inside recurring templates.
+    # A recurring template's boundary sequence and core sequence both
+    # reflect a layer that the rank emitted multiple times; an interior
+    # residual whose layer terms are a *subset* of any such layer is by
+    # construction a partial slice of a proven body, not an unexplained
+    # island.  Comparing as a subset on the ``|``-split term set (rather
+    # than string equality) tolerates a residual that omits the
+    # attention or MoE portion of a richer layer — that is precisely
+    # the shape of the leftover ``[block_head|moe.combine]`` or
+    # ``[lightning_indexer|...|moe.dispatch_expert_compute]`` fragments
+    # seen between recurring DSV4 decode / 0420 prefill bodies.
+    template_layer_term_sets: list[frozenset[str]] = []
+    for plan in plans:
+        if plan_is_template_residual(plan):
+            continue
+        if not plan.complete or len(plan.main_layers) < 2:
+            continue
+        for layer in plan.main_layers:
+            for keyfn in (core_role_key, layer_boundary_key):
+                key = keyfn(layer.signature)
+                if not key:
+                    continue
+                term_set = frozenset(part for part in key.split("|") if part)
+                if term_set:
+                    template_layer_term_sets.append(term_set)
+
+    # Count how often each residual layer-sequence repeats across the
+    # rank.  A 1-layer residual whose ``core_role_key`` recurs >= 2
+    # times is a stable recurring fragment (e.g. dsv4 0420 prefill emits
+    # 22 identical ``[lightning_indexer + rope + dispatch_expert_compute]``
+    # TBO-style bridge fragments).  Treat such fragments as
+    # ``partial_body_window`` instead of ``unclassified_island`` so the
+    # validator does not raise.  Single-layer plans are normally
+    # excluded from the boundary-template counter (``> 1`` filter) for
+    # safety, so this check has to be done explicitly here.
+    residual_core_sequence_counts: Counter[tuple[str, ...]] = Counter(
+        tuple(core_role_key(layer.signature) for layer in plan.main_layers)
+        for plan in plans
+        if plan_is_template_residual(plan)
     )
     classified: list[StepPlan] = []
     for index, plan in enumerate(plans):
@@ -1836,7 +1927,36 @@ def classify_residual_plans(plans: Sequence[StepPlan]) -> list[StepPlan]:
         elif index == len(plans) - 1:
             segment_type = "tail"
         else:
-            segment_type = "unclassified_island"
+            # An interior template residual is a ``partial_body_window``
+            # under either of these conditions:
+            #
+            # (a) Every layer's terms are a subset of some recurring
+            #     template's layer.  This catches the "stripped-down"
+            #     case (residual is a sub-slice of a known layer; e.g.
+            #     ``[block_head|moe.combine]`` carving the attention
+            #     half off a ``[rope|block_head|moe.combine]`` layer).
+            #
+            # (b) The residual's own core-role sequence recurs >= 2
+            #     times among all template residuals in this rank.
+            #     This catches the "superset/composite" case (residual
+            #     is structurally richer than any single template layer
+            #     but is itself a stable recurring fragment; e.g.
+            #     ``[lightning_indexer + rope + dispatch_expert_compute]``
+            #     TBO bridge in dsv4 0420 prefill, observed 22x).
+            #
+            # In either case the fragment is provably part of the
+            # rank's recurring structure, not an unexplained island.
+            residual_core_sequence = tuple(
+                core_role_key(layer.signature) for layer in plan.main_layers
+            )
+            is_known_fragment = (
+                template_layer_term_sets
+                and _layers_subset_of_template_layers(plan.main_layers, template_layer_term_sets)
+            ) or residual_core_sequence_counts.get(residual_core_sequence, 0) >= 2
+            if is_known_fragment:
+                segment_type = "partial_body_window"
+            else:
+                segment_type = "unclassified_island"
         classified.append(
             StepPlan(
                 frames=plan.frames,
@@ -1929,16 +2049,62 @@ def classify_interior_substructure_plans(plans: Sequence[StepPlan]) -> list[Step
     if not reference_frames:
         return list(plans)
 
+    # Hoist per-reference quantities out of the inner loop.  Without this
+    # ``is_substructure_of_reference`` recomputes the same boundary sequence
+    # and core component counter for every reference frame on every candidate,
+    # which is the dominant cost on long single-rank profiles (dsv3-class
+    # 90k+ event traces with thousands of plans).
+    reference_core_counters: list[Counter[str]] = [frame_coarse_core_components(ref) for ref in reference_frames]
+    reference_boundary_counters: list[Counter[str]] = [Counter(frame_boundary_sequence(ref)) for ref in reference_frames]
+    reference_lengths: list[int] = [len(ref.layers) for ref in reference_frames]
+    # Workload signature for each reference: does it contain any attention
+    # term?  Used to suppress cross-workload demotion (a reference body
+    # that carries attention cannot serve as the ``parent'' of a candidate
+    # that carries no attention at all — they are different forwards, not
+    # fragments of the same forward).  See Fix B regression test.
+    reference_has_attention_flags: list[bool] = [
+        any(key.startswith("attention") for key in counter)
+        for counter in reference_core_counters
+    ]
+
     def is_substructure_of_reference(plan: StepPlan) -> bool:
-        candidate = LayerFrame(plan.main_layers, reason=plan.reason)
-        return any(
-            len(plan.main_layers) != len(reference.layers)
-            and (
-                strict_core_component_substructure(candidate, reference)
-                or strict_boundary_substructure(candidate, reference)
-            )
-            for reference in reference_frames
-        )
+        candidate_len = len(plan.main_layers)
+        # Only compute candidate-side counters when actually needed: many
+        # candidates are immediately filtered by length equality.
+        candidate_core: Counter[str] | None = None
+        candidate_boundary: Counter[str] | None = None
+        candidate_has_attention = plan_has_primary_attention(plan)
+        for index, ref_len in enumerate(reference_lengths):
+            if candidate_len == ref_len:
+                continue
+            # Cross-workload guard: an attention-bearing reference body
+            # cannot be the parent of a candidate that carries no
+            # attention at all.  Without this, mixed-traffic EP profiles
+            # (e.g. dsv4 350TPS) silently merge decode MoE-only mini
+            # bodies into a co-resident prefill mega-step because the
+            # mega-step's per-role coarse counter trivially dominates
+            # any short MoE-only candidate's counter.
+            if reference_has_attention_flags[index] and not candidate_has_attention:
+                continue
+            if candidate_core is None:
+                candidate_core = frame_coarse_core_components(LayerFrame(plan.main_layers, reason=plan.reason))
+            ref_core = reference_core_counters[index]
+            if (
+                candidate_core
+                and candidate_core != ref_core
+                and all(ref_core[key] >= value for key, value in candidate_core.items())
+            ):
+                return True
+            if candidate_boundary is None:
+                candidate_boundary = Counter(frame_boundary_sequence(LayerFrame(plan.main_layers, reason=plan.reason)))
+            ref_boundary = reference_boundary_counters[index]
+            if (
+                candidate_boundary
+                and candidate_boundary != ref_boundary
+                and all(ref_boundary[key] >= value for key, value in candidate_boundary.items())
+            ):
+                return True
+        return False
 
     classified: list[StepPlan] = []
     for index, plan in enumerate(plans):
@@ -1946,7 +2112,20 @@ def classify_interior_substructure_plans(plans: Sequence[StepPlan]) -> list[Step
             classified.append(plan)
             continue
         is_substructure = is_substructure_of_reference(plan)
-        if is_substructure and (not plan_has_primary_attention(plan) or surrounded_by_complete_attention(plans, index)):
+        # ``surrounded_by_complete_attention`` is the safety net that
+        # distinguishes "real fragment embedded between two attention
+        # bodies" from "a different workload that merely shares some
+        # roles with a longer reference body".  Previously the check was
+        # skipped entirely for candidates without their own attention
+        # term, on the assumption that such candidates can never be a
+        # legitimate standalone step.  This is false for mixed-traffic
+        # EP profiles: a prefill mega-step (one long attention body)
+        # then absorbs all decode MoE-only mini-steps (no attention) in
+        # the same rank as runner_window, even though they are
+        # completely independent forwards.  Require the surrounded
+        # check uniformly so a singleton reference body cannot drag
+        # unrelated short bodies into its scope.
+        if is_substructure and surrounded_by_complete_attention(plans, index):
             segment_type = "partial_body_window" if plan_has_primary_attention(plan) else "runner_window"
             classified.append(
                 StepPlan(
@@ -2007,7 +2186,46 @@ def classify_interior_substructure_plans(plans: Sequence[StepPlan]) -> list[Step
             )
             continue
         repaired.append(plan)
-    return repaired
+    # Third pass — absorb interior non-complete residuals sandwiched between
+    # explained-type neighbors. These appear on dsv4 sparse-attention prefill
+    # traces (e.g. 350TPS) where step splitting marks short ~1-layer slices
+    # as ``complete=True`` references, leaving a large multi-body residual
+    # whose layer count exceeds every reference (so the substructure-of-
+    # reference check above fails) but which is still sandwiched between
+    # plans the segmenter has already explained. Demoting to
+    # ``partial_body_window`` / ``runner_window`` is the right behavior:
+    # downstream stages still see these segments and can flag them, but the
+    # segment stage no longer aborts the pipeline with
+    # ``interior_template_residual`` for residuals that lie fully inside
+    # already-explained bounds.
+    sandwich_explained = explained_types | {"head", "tail"}
+
+    def _is_explained(plan_: StepPlan | None) -> bool:
+        if plan_ is None:
+            return False
+        return plan_.complete or plan_.segment_type in sandwich_explained
+
+    finalized: list[StepPlan] = []
+    for index, plan in enumerate(repaired):
+        if (
+            not plan.complete
+            and plan.segment_type not in sandwich_explained
+            and _is_explained(repaired[index - 1] if index > 0 else None)
+            and _is_explained(repaired[index + 1] if index + 1 < len(repaired) else None)
+        ):
+            segment_type = "partial_body_window" if plan_has_primary_attention(plan) else "runner_window"
+            finalized.append(
+                StepPlan(
+                    frames=plan.frames,
+                    main_frame_count=plan.main_frame_count,
+                    reason=f"{plan.reason}+interior_residual_between_explained_plans",
+                    segment_type=segment_type,
+                    complete=False,
+                )
+            )
+            continue
+        finalized.append(plan)
+    return finalized
 
 
 def merge_explained_windows_to_templates(plans: Sequence[StepPlan]) -> list[StepPlan]:
@@ -2315,6 +2533,22 @@ def validate_unresolved_composite_bodies(rank_id: str, plans: Sequence[StepPlan]
     errors: list[dict[str, Any]] = []
     for plan in plans:
         sequence = tuple(core_role_key(layer.signature) for layer in plan.main_layers)
+        # A plan whose own multi-layer sequence is itself a recurring
+        # template (>= 2 occurrences) is direct evidence of a real step
+        # structure observed multiple times in this rank.  Demanding
+        # that it also be coverable by *strictly smaller* templates
+        # produces false positives whenever a rank legitimately emits a
+        # body that wraps an MoE-style sub-step (e.g. dsv4 prefill
+        # ``[combine, gating, dispatch, expert_matmul x2, combine]``
+        # appearing 30+ times) or a multi-step concatenation that the
+        # selection-row splitter cannot break apart further.  Accept
+        # the sequence as a valid step structure on the strength of
+        # recurrence alone before running the embedded-template check.
+        if sequence_counts.get(sequence, 0) >= 2:
+            continue
+        boundary_sequence = tuple(layer_boundary_key(layer.signature) for layer in plan.main_layers)
+        if boundary_sequence_counts.get(boundary_sequence, 0) >= 2:
+            continue
         smaller_templates = tuple(template for template in templates if 0 < len(template) < len(sequence))
         if not smaller_templates:
             continue
@@ -2327,7 +2561,6 @@ def validate_unresolved_composite_bodies(rank_id: str, plans: Sequence[StepPlan]
             continue
         if exact_cover_sequence(sequence, smaller_templates) is not None:
             continue
-        boundary_sequence = tuple(layer_boundary_key(layer.signature) for layer in plan.main_layers)
         smaller_boundary_templates = tuple(template for template in boundary_templates if 0 < len(template) < len(boundary_sequence))
         if exact_cover_sequence(boundary_sequence, smaller_boundary_templates) is not None:
             continue

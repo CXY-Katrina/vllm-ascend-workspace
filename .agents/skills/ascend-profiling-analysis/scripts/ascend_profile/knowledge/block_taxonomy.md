@@ -69,6 +69,109 @@ on-device sequencing in `kernel_details.csv` and is independent of
 stream skew, so two ranks executing the same layer always agree on the
 boundary.
 
+## 3a. Attention sub-family (annotation, not a separate `block_kind`)
+
+The block kind stays at the coarse `attention` granularity, but the
+analyser annotates each attention block with the **attention family**
+that produced it.  Detection is signature-based and uses category labels
+emitted in `op_categories`, never single-kernel substring matches.  The
+full rules live in `knowledge/attention_families.yaml`; the decision
+order is:
+
+Family names follow the **DeepSeek papers**, not the CANN backend
+class (DSA and CSA both route through `AscendSFABackend` on Ascend,
+but they are different paper architectures distinguished by whether
+the Compressor kernel is present). The decision is implemented exactly
+once in `common.resolve_attention_family(categories)`, where
+`categories` is the union of `op_categories` emitted by
+`categories_and_roles` for the events in the block. The HTML report
+function `detect_attention_subtype` is a thin wrapper around that
+resolver, so the report and the unit-test contract cannot drift apart.
+
+1. `attention.kv_compressor` AND `attention.lightning_indexer` AND
+   `attention.sparse_sharedkv` → **CSA** (DeepSeek-V4 main layers,
+   "Compressed Sparse Attention" per the V4 paper).
+2. else `attention.kv_compressor` AND `attention.flash_score` with NO
+   indexer / sparse-sharedkv → **HCA** (DeepSeek-V4 alternating layers,
+   "Heavily Compressed Attention"; heuristic).
+3. else `attention.lightning_indexer` AND `attention.sparse_sharedkv`,
+   NO `attention.kv_compressor` → **DSA** (DeepSeek-V3.2,
+   "DeepSeek Sparse Attention" per arxiv 2512.02556 §4).
+4. else any of `attention.mla.preprocess` /
+   `attention.mla.kv_norm_rope_cache` / `attention.mla.v_up_proj`,
+   with NO sparse signatures → **MLA** (DeepSeek-V2 / V3).
+5. else `attention.linear_or_mamba` present → **linear / mamba / GDN**.
+6. else `attention.flash_score` only → **gqa_or_mha** (dense flash-style
+   attention umbrella, from kernel categories).
+
+   The underlying kernel (FIA / `UnpadFlashAttention`) supports MHA,
+   GQA, AND MQA via `num_key_value_heads` per the CANN docs. From
+   kernel categories alone we can't pick between them — hence the
+   umbrella label.
+
+   (The same kernel also supports MLA via num_kv=1, but MLA-architected
+   layers carry MLA-specific companions like `MlaProlog` /
+   `KvRmsNormRopeCache` which are picked up earlier in the decision
+   order, so MLA blocks still pin cleanly to `mla`.)
+
+7. **Shape-based refinement (best-effort)** — `common.refine_dense_attention_from_shapes`:
+
+   After step 6 lands on `gqa_or_mha`, we read
+   `kernel_details.csv:Input Shapes` for the FIA / UnpadFA events in
+   the block and try to upgrade the label:
+
+   * `num_q_heads == num_kv_heads`                     → `mha`
+   * `num_q_heads >  num_kv_heads`, integer ratio       → `gqa`
+   * `num_kv_heads == 1` with `num_q_heads > 1`          → `mqa`
+   * else (no shapes / sanity-check fail / ambiguous)    → `gqa_or_mha`
+
+   Sanity checks:
+   * `head_dim` (last axis) must be in a known-good set
+     (sanity check we picked Q/K not e.g. mask / pse).
+   * `num_heads` (second-to-last) must be in `[1, 1024]`.
+   * Q and K must share `head_dim`.
+   * Across multiple FIA events in the same block, the winning kind
+     must have outright majority.
+
+   Why this is best-effort, not a contract:
+   * CANN profiler may omit Input Shapes on some rows (post-aclgraph
+     compile).
+   * Tensor order in `input[0..2]` matches the CANN FIA ABI for the
+     ops we see today; if vllm-ascend introduces a wrapper that
+     reorders inputs, refinement may pick the wrong tensor.
+   * Refinement only runs when step 6 lands on `gqa_or_mha`; it never
+     overrides MLA / CSA / HCA / DSA / linear decisions.
+
+   The previous `fa` family value was removed for an unrelated
+   reason — `UnpadFlashAttention` is the dense long-context branch of
+   `AscendAttentionBackend`, NOT a separate FA backend.
+
+Three earlier traps this category-driven decision avoids:
+* `UnpadFlashAttention` returning `fa` from a raw-substring matcher
+  while the YAML mapped it to the dense path (contract drift).
+* The kernel category baking in a GQA-only architecture inference —
+  CANN's FIA op explicitly supports MHA / GQA / MLA via
+  `num_key_value_heads`. The category was renamed
+  `attention.gqa_or_mha → attention.flash_score` and is now neutral.
+* A block containing only `KVQuantSparseAttnSharedKVMetadata`
+  satisfying the main sparse-shared-KV signature because the substring
+  `sharedkv` was loose. The metadata sub-category
+  (`attention.sparse_sharedkv.metadata`) is deliberately separate and
+  never satisfies the CSA / DSA must-have set.
+
+`attention.kvcomp.topk` is an *overlay* on top of one of the above
+(Hamming-distance KV pruning helper) — it does not change the host
+family, only appends a `+kvc` suffix to the label.
+
+The sparse-attention kernel categories (`attention.sparse_sharedkv`,
+`attention.lightning_indexer`, `attention.kv_compressor`) are kept
+**paper-neutral** so the same Compressor kernel can serve both CSA
+and HCA without baking the V4 architecture name into the kernel
+label.
+
+The label feeds `html_report.detect_attention_subtype` and the L2 block
+header.  It does NOT change segmentation or the bound calculation.
+
 ## 4. Why we don't split FFN further
 
 Splitting `ffn` into "gate matmul / up matmul / down matmul" would be

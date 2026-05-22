@@ -38,7 +38,12 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+try:
+    from ascend_profile import common  # type: ignore
+except ImportError:  # pragma: no cover - allow running from scripts/ directly
+    import common  # type: ignore[no-redef]
 
 csv.field_size_limit(10 * 1024 * 1024)
 
@@ -371,40 +376,91 @@ def assess_companion_run(b) -> dict:
     }
 
 
-def detect_attention_subtype(b, row_start: int, row_end: int, rank_id: str) -> str:
-    """Inspect kernels within [row_start, row_end) of `rank_id` to identify attention sub-type.
+def attention_categories_for_events(events: Iterable[Event]) -> set[str]:
+    """Union of ``op_categories`` emitted by ``common.categories_and_roles``
+    for the given events. Used as the input to ``resolve_attention_family``.
 
-    Returns one of: 'mla' (DeepSeek-style sparse / compressed-KV), 'fa' (FlashAttention),
-    'gqa' (FIA with grouped-query — assumed default for FIA users), 'attn' (unknown).
+    Kept as a module-level helper so unit tests can call it directly with
+    a list of fake ``Event``-shaped objects (they only need ``name``,
+    ``task_type``, and ``accel_core``).
+    """
+    cats: set[str] = set()
+    for event in events:
+        cat_tuple, _ = common.categories_and_roles(
+            short_op_name(event.name),
+            getattr(event, "task_type", "") or "",
+            getattr(event, "accel_core", "") or "",
+        )
+        cats.update(cat_tuple)
+    return cats
+
+
+def detect_attention_subtype(b, row_start: int, row_end: int, rank_id: str) -> str:
+    """Decide the paper-aligned attention family for a block by reusing
+    the canonical category-driven resolver in
+    ``common.resolve_attention_family``.
+
+    Returns one of: ``csa`` / ``hca`` / ``dsa`` / ``mla`` / ``linear`` /
+    ``gqa_or_mha`` / ``attn``. A trailing ``+kvc`` suffix indicates the
+    Hamming-distance KV-compression overlay is active.
+
+    The CANN / vllm-ascend implementation routes both DSA and CSA / HCA
+    through ``AscendSFABackend`` (``sfa_v1.py``); we keep the paper
+    names in the report and document the backend identity in
+    ``attention_families.yaml``.
+
+    Earlier drafts of this function did raw kernel-name substring
+    matching, which diverged from the YAML / unit-test contract on two
+    edge cases:
+      * ``UnpadFlashAttention`` returned ``fa`` here but is mapped to
+        ``attention.flash_score`` by ``kernel_signatures.yaml`` (because
+        it's the long-context branch of the dense
+        ``AscendAttentionBackend``, NOT a separate FA backend);
+      * blocks containing only ``KVQuantSparseAttnSharedKVMetadata``
+        satisfied ``has_sparse_sharedkv`` because of the loose
+        ``sharedkv`` substring — yet the YAML contract requires the
+        main category (``attention.sparse_sharedkv``), not the metadata
+        sub-category.
+    Routing the decision through ``categories_and_roles`` eliminates
+    both divergences.
+
+    Decision order mirrors ``knowledge/attention_families.yaml:cheat_sheet``.
+
+    Shape-based refinement of ``gqa_or_mha``:
+        After the category resolver returns its terminal label, if the
+        family is ``gqa_or_mha`` we make one best-effort attempt to
+        upgrade it to ``mha`` / ``gqa`` / ``mqa`` by reading the Q/K
+        Input Shapes recorded in ``kernel_details.csv`` for the FIA /
+        UnpadFA events in this block (see
+        ``common.refine_dense_attention_from_shapes``). When shapes are
+        missing or fail sanity checks we keep the umbrella
+        ``gqa_or_mha``. The refinement is a heuristic — it depends on
+        CANN serialising Input Shapes correctly and on us latching onto
+        the right Q/K tensors — so we never override the
+        category-based decision for anything other than ``gqa_or_mha``.
     """
     events = events_in_row_range(b.events, row_start, row_end, rank_id)
-    name_set = {short_op_name(e.name) for e in events}
-    name_lower = {n.lower() for n in name_set}
-    mla_markers = ("matmulcompressedkv", "absorbmatmul", "mlaprolog",
-                   "sparseattnsharedkv", "compressor")
-    if any(any(m in n for m in mla_markers) for n in name_lower):
-        return "mla"
-    if any("flashattention" in n for n in name_lower):
-        return "fa"
-    if any("fusedinferattention" in n or n.startswith("fia") for n in name_lower):
-        return "gqa"  # vLLM-Ascend uses FIA for GQA/MHA; sub-precision needs shape parse
-    return "attn"
+    cats = attention_categories_for_events(events)
+    family = common.resolve_attention_family(cats)
+    # Best-effort shape refinement; only acts on the dense umbrella
+    # label (and its `+kvc` variant) so it never disturbs MLA / CSA /
+    # HCA / DSA / linear decisions.
+    if family == "gqa_or_mha" or family.startswith("gqa_or_mha+"):
+        refined = common.refine_dense_attention_from_shapes(events)
+        if refined != "gqa_or_mha":
+            family = family.replace("gqa_or_mha", refined, 1)
+    return family
 
 
 def derive_layer_composition(b, ls: dict) -> str:
-    """Derive layer composition from block_segments, e.g. 'gqa+moe', 'mla+ffn', 'moe'.
+    """Derive layer composition from block_segments, e.g. 'gqa_or_mha+moe', 'mla+ffn', 'moe'.
 
     Falls back to '—' when no blocks are recorded under this layer.
     """
     rid = ls["rank_id"]
     r_start = int(safe_float(ls["row_start"]))
     r_end = int(safe_float(ls["row_end"]))
-    blocks = [
-        bs for bs in b.block_segments
-        if bs["rank_id"] == rid
-        and int(safe_float(bs["row_start"])) >= r_start
-        and int(safe_float(bs["row_end"])) <= r_end
-    ]
+    blocks = block_segments_in_layer(b, rid, r_start, r_end)
     blocks.sort(key=lambda x: int(safe_float(x["row_start"])))
     parts = []
     for bs in blocks:
@@ -442,7 +498,7 @@ def guess_model_structure(b, step_row: dict) -> str | None:
     rid = step_row["rank_id"]
     # use the step's row range as the inspection window
     seg_id = step_row.get("segment_id")
-    seg = next((s for s in b.step_segments if s["segment_id"] == seg_id), None)
+    seg = b._step_seg_by_id.get(seg_id) if seg_id else None
     if seg is None:
         return f"{layer_count}L · ?+{'moe' if has_moe else ('ffn' if has_attn else '?')}"
     attn_sub = detect_attention_subtype(
@@ -523,7 +579,7 @@ def split_main_speculative_tail(b, step_seg: dict, rank_id: str) -> dict:
     step_events = events_in_row_range(b.events, step_row_start, step_row_end, rank_id)
 
     seg_id = step_seg["segment_id"]
-    anatomy = next((a for a in b.step_anatomy if a["segment_id"] == seg_id), None)
+    anatomy = b._step_anatomy_by_id.get(seg_id)
     head_row_start = int(safe_float((anatomy or {}).get("head_row_start") or step_row_start))
     head_row_end   = int(safe_float((anatomy or {}).get("head_row_end") or step_row_start))
     main_row_start = int(safe_float((anatomy or {}).get("main_row_start") or step_row_start))
@@ -533,11 +589,8 @@ def split_main_speculative_tail(b, step_seg: dict, rank_id: str) -> dict:
 
     # speculative layers within this step
     spec_layers = [
-        ls for ls in b.layer_segments
-        if ls["rank_id"] == rank_id
-        and ls["row_start"] >= step_row_start
-        and ls["row_end"] <= step_row_end
-        and ls.get("layer_role") in ("speculative", "spec", "spec_layer")
+        ls for ls in layer_segments_in_step(b, rank_id, step_row_start, step_row_end)
+        if ls.get("layer_role") in ("speculative", "spec", "spec_layer")
     ]
     spec_rows = set()
     for ls in spec_layers:
@@ -724,6 +777,25 @@ class Bundle:
     step_segments: list = field(default_factory=list)
     layer_segments: list = field(default_factory=list)
     block_segments: list = field(default_factory=list)
+    # Per-rank, row_start-sorted layer_segments / block_segments / step_segments +
+    # parallel row_start arrays for bisect-based "events fully inside [rs, re]"
+    # membership lookups, plus segment_id and step_segment_id maps. Without
+    # these the L2 / L3 renderers scan the full lists once per step:
+    #
+    # * layer_segments scan in render_l2 / split_main_speculative_tail
+    # * block_segments scan in derive_layer_composition (called per layer)
+    # * step_segments / step_anatomy linear next() lookups
+    #
+    # On the prefill_analyse case (21 k step segments × 65 k layer segments) this
+    # was ~1.4 B comparisons and triggered the 30-min report-stage timeout.
+    _layer_segs_by_rank: dict = field(default_factory=dict)
+    _layer_seg_row_starts_by_rank: dict = field(default_factory=dict)
+    _layer_seg_row_ends_by_rank: dict = field(default_factory=dict)
+    _block_segs_by_rank: dict = field(default_factory=dict)
+    _block_seg_row_starts_by_rank: dict = field(default_factory=dict)
+    _block_seg_row_ends_by_rank: dict = field(default_factory=dict)
+    _step_seg_by_id: dict = field(default_factory=dict)
+    _step_anatomy_by_id: dict = field(default_factory=dict)
 
 
 def _load_segments(path: Path, key: str) -> list:
@@ -893,8 +965,126 @@ def _build_rank_event_index(events_by_row: list) -> None:
         _RANK_EVENT_ROWS[rid] = [e.row_idx for e in lst]
 
 
+def _build_segments_index(segments: list, row_safe: bool = False) -> tuple[dict, dict, dict]:
+    """Bucket segments by rank_id and sort each bucket by row_start.
+
+    Returns ``(segs_by_rank, row_starts_by_rank, row_ends_by_rank)``.
+    """
+    buckets: dict[str, list] = defaultdict(list)
+    for seg in segments:
+        rid = seg.get("rank_id")
+        if rid is None:
+            continue
+        buckets[rid].append(seg)
+    by_rank: dict[str, list] = {}
+    starts_by_rank: dict[str, list[int]] = {}
+    ends_by_rank: dict[str, list[int]] = {}
+    if row_safe:
+        rs_key = lambda x: int(safe_float(x.get("row_start", 0)))
+        re_key = lambda x: int(safe_float(x.get("row_end", 0)))
+    else:
+        rs_key = lambda x: int(x.get("row_start", 0))
+        re_key = lambda x: int(x.get("row_end", 0))
+    for rid, lst in buckets.items():
+        lst.sort(key=rs_key)
+        by_rank[rid] = lst
+        starts_by_rank[rid] = [rs_key(x) for x in lst]
+        ends_by_rank[rid] = [re_key(x) for x in lst]
+    return by_rank, starts_by_rank, ends_by_rank
+
+
+def _build_layer_seg_rank_index(b: "Bundle") -> None:
+    """Build all per-rank segment indexes + id maps used by the renderers.
+
+    Replaces multiple O(N) ``[ls for ls in b.layer_segments if ...]`` and
+    ``next((s for s in b.step_segments if ...))`` scans that ran once per
+    step in the L2/L3 renderers — the dominant cost on large multi-rank
+    prefill traces.
+    """
+    (
+        b._layer_segs_by_rank,
+        b._layer_seg_row_starts_by_rank,
+        b._layer_seg_row_ends_by_rank,
+    ) = _build_segments_index(b.layer_segments)
+    (
+        b._block_segs_by_rank,
+        b._block_seg_row_starts_by_rank,
+        b._block_seg_row_ends_by_rank,
+    ) = _build_segments_index(b.block_segments, row_safe=True)
+    b._step_seg_by_id = {s.get("segment_id"): s for s in b.step_segments if s.get("segment_id")}
+    b._step_anatomy_by_id = {a.get("segment_id"): a for a in b.step_anatomy if a.get("segment_id")}
+
+
+def layer_segments_in_step(b: "Bundle", rank_id: str, row_start: int, row_end: int) -> list:
+    """Return layer_segments fully contained within ``[row_start, row_end]``.
+
+    O(log L + k) per call when the rank index is populated; O(L) fallback.
+    A layer segment ``ls`` is "in the step" iff
+    ``row_start <= ls.row_start`` AND ``ls.row_end <= row_end`` —
+    matches the inclusive-on-both-ends convention used everywhere else.
+    """
+    lst = b._layer_segs_by_rank.get(rank_id)
+    if lst is None:
+        return [
+            ls for ls in b.layer_segments
+            if ls.get("rank_id") == rank_id
+            and int(ls.get("row_start", 0)) >= row_start
+            and int(ls.get("row_end", 0)) <= row_end
+        ]
+    starts = b._layer_seg_row_starts_by_rank.get(rank_id, [])
+    ends = b._layer_seg_row_ends_by_rank.get(rank_id, [])
+    lo = bisect.bisect_left(starts, row_start)
+    hi = bisect.bisect_right(starts, row_end)
+    out: list = []
+    for idx in range(lo, hi):
+        if ends[idx] <= row_end:
+            out.append(lst[idx])
+    return out
+
+
+def block_segments_in_layer(b: "Bundle", rank_id: str, row_start: int, row_end: int) -> list:
+    """Return block_segments fully contained within ``[row_start, row_end]``.
+
+    Same bisect strategy as ``layer_segments_in_step``. Used by
+    ``derive_layer_composition`` which previously did a full scan of
+    ``b.block_segments`` for every layer in every step.
+    """
+    lst = b._block_segs_by_rank.get(rank_id)
+    if lst is None:
+        return [
+            bs for bs in b.block_segments
+            if bs.get("rank_id") == rank_id
+            and int(safe_float(bs.get("row_start", 0))) >= row_start
+            and int(safe_float(bs.get("row_end", 0))) <= row_end
+        ]
+    starts = b._block_seg_row_starts_by_rank.get(rank_id, [])
+    ends = b._block_seg_row_ends_by_rank.get(rank_id, [])
+    lo = bisect.bisect_left(starts, row_start)
+    hi = bisect.bisect_right(starts, row_end)
+    out: list = []
+    for idx in range(lo, hi):
+        if ends[idx] <= row_end:
+            out.append(lst[idx])
+    return out
+
+
 def events_in_row_range(events_by_row: list, row_start: int, row_end: int, rank_id: str | None = None) -> list:
     """`events_by_row` must be pre-sorted by row_idx.
+
+    Boundaries are **inclusive** on both ends: ``[row_start, row_end]``.
+    This matches ``row_start`` / ``row_end`` everywhere else in the
+    pipeline (``step_segments.json``, ``layer_segments.json``,
+    ``block_segments.json``) which all use closed intervals — e.g. a
+    block recorded as ``(row_start=106, row_end=121, event_count=16)``
+    covers exactly the 16 rows ``106..121``.
+
+    Using a half-open ``[row_start, row_end)`` here would silently drop
+    the event sitting on the last row of every segment. That row is
+    operationally significant: in vLLM-Ascend attention blocks the
+    closing FIA / UnpadFlashAttention score kernel is precisely the
+    last row, so a half-open query was making attention sub-type
+    detection return ``attn`` (no flash_score category seen) instead
+    of ``mha`` / ``gqa_or_mha`` / etc.
 
     IMPORTANT: row_idx is per-source (per-rank), not globally unique. When pulling events
     for a specific step/layer/block segment, ALWAYS pass rank_id to filter out events from
@@ -907,13 +1097,13 @@ def events_in_row_range(events_by_row: list, row_start: int, row_end: int, rank_
         lst = _RANK_EVENT_INDEX[rank_id]
         rows = _RANK_EVENT_ROWS[rank_id]
         lo = bisect.bisect_left(rows, row_start)
-        hi = bisect.bisect_left(rows, row_end)
+        hi = bisect.bisect_right(rows, row_end)
         return lst[lo:hi]
     out = []
     for e in events_by_row:
         if e.row_idx < row_start:
             continue
-        if e.row_idx >= row_end:
+        if e.row_idx > row_end:
             continue
         if rank_id is not None and e.rank_id != rank_id:
             continue
@@ -950,6 +1140,7 @@ def load_bundle(root: Path) -> Bundle:
     b.step_segments = _load_segments(root / "step_segments.json", "step_segments")
     b.layer_segments = _load_segments(root / "layer_segments.json", "layer_segments")
     b.block_segments = _load_segments(root / "block_segments.json", "block_segments")
+    _build_layer_seg_rank_index(b)
     print(f"loading events from normalized_event_index.csv ...", file=sys.stderr)
     b.events = _load_events(root / "normalized_event_index.csv")
     b.events.sort(key=lambda e: e.row_idx)
@@ -2465,12 +2656,15 @@ def _render_l2_single_step(b: "Bundle", s: dict, view_id: str,
     )
 
     # Layer list — every layer routes to its step_class's rep step's L3 view.
-    layers_in_step = sorted([
-        ls for ls in b.layer_segments
-        if ls["rank_id"] == rid
-        and ls["row_start"] >= step_seg_meta.get("row_start", 0)
-        and ls["row_end"] <= step_seg_meta.get("row_end", 0)
-    ], key=lambda x: x["row_start"])
+    layers_in_step = sorted(
+        layer_segments_in_step(
+            b,
+            rid,
+            int(step_seg_meta.get("row_start", 0)),
+            int(step_seg_meta.get("row_end", 0)),
+        ),
+        key=lambda x: x.get("row_start", 0),
+    )
 
     # find the L3 target step for this step's step_class.
     # Precedence: 1) this step IS the rep → use own L3
@@ -2558,8 +2752,14 @@ def _render_l2_single_step(b: "Bundle", s: dict, view_id: str,
         '<h3 style="margin-top:0">Layer 顺序 · 点击任一 layer 进入 L3</h3>'
         '<div class="muted" style="font-size:11.5px;margin-bottom:6px">'
         '<b>Composition</b> 列：根据 block_segments 推断的 attention sub-type + ffn/moe 组合。'
-        '<code>gqa</code> = FIA 路径（vLLM-Ascend Qwen/Llama）；<code>mla</code> = DeepSeek 系列稀疏 attention（SparseAttnSharedkv / Compressor / MatmulCompressedKV）；'
-        '<code>fa</code> = FlashAttention prefill 路径。'
+        '<code>mha</code>/<code>gqa</code>/<code>mqa</code> = FIA / UnpadFlashAttention 路径，'
+        '由 kernel_details.csv 里的 <code>Input Shapes</code> 字段读出 Q/K 的 head 数 best-effort 推断；'
+        '<code>gqa_or_mha</code> = 同一条 FIA / UnpadFA 路径但 shape 缺失或异常时的 fallback 标签；'
+        '<code>mla</code> = DeepSeek V2/V3 (Multi-head Latent Attention)；'
+        '<code>dsa</code> = DeepSeek V3.2 (Sparse Attention)；'
+        '<code>csa</code> = DeepSeek V4 主层 (Compressed Sparse Attention)；'
+        '<code>hca</code> = DeepSeek V4 交替层 (Heavily Compressed Attention)；'
+        '<code>linear</code> = Mamba / GDN / 线性 attention。'
         '</div>'
         '<div class="kernel-rollup" style="margin-top:6px">'
         '<div class="kernel-row head" style="grid-template-columns:50px 1.2fr 0.6fr 1.0fr 0.5fr 0.4fr 0.4fr">'
@@ -2653,12 +2853,15 @@ def render_l3_views(b: "Bundle") -> str:
         kernel_step_union_us = union_duration_us_by_name(step_events_active)
         kernel_step_count = Counter(short_op_name(e.name) for e in step_events_active)
 
-        layers = sorted([
-            ls for ls in b.layer_segments
-            if ls["rank_id"] == rank_id
-            and ls["row_start"] >= step_meta["row_start"]
-            and ls["row_end"] <= step_meta["row_end"]
-        ], key=lambda x: x["row_start"])
+        layers = sorted(
+            layer_segments_in_step(
+                b,
+                rank_id,
+                int(step_meta["row_start"]),
+                int(step_meta["row_end"]),
+            ),
+            key=lambda x: x.get("row_start", 0),
+        )
         for ls in layers:
             lay_idx = ls.get("layer_index", "?")
             role = ls.get("layer_role", "main")
@@ -2690,6 +2893,35 @@ def _render_l3_layer(b: "Bundle", view_id: str, parent_seg_id: str,
     title = f"Layer {lay_idx} · {role} · active {layer_busy_us/1000:.2f} ms · {len(lev_active)} ops"
     l2_view = f"view-l2-{parent_seg_id}"
 
+    # Cap the number of fully-rendered operator cards per layer. The full
+    # 46-field operator card carries ~200 lines of HTML each; rendering all
+    # of them for layers with thousands of events blows up both wall time
+    # (350TPS rep-step layers hold ~1600 events; 105 such layers × 1600
+    # cards × heavy formatting was the dominant cost driving the report-
+    # stage timeout) and final HTML size. Always show the row index, but
+    # only emit a click-to-expand operator card for the top-N events by
+    # duration; the rest still appear in the list with a "(card not
+    # rendered — layer too large)" placeholder so the user still sees the
+    # operator timeline.
+    OP_CARD_PER_LAYER_LIMIT = 200
+    if len(lev_active) > OP_CARD_PER_LAYER_LIMIT:
+        card_eligible_idx = {
+            i for i, _ in sorted(
+                enumerate(lev_active),
+                key=lambda iv: -iv[1].duration_us,
+            )[:OP_CARD_PER_LAYER_LIMIT]
+        }
+        size_note = (
+            f'<div class="muted" style="font-size:11px;margin-top:6px;color:#f0883e">'
+            f'本 layer 共 {len(lev_active)} ops；为控制 HTML 体积，'
+            f'仅前 {OP_CARD_PER_LAYER_LIMIT} 个最长耗时算子展开 46 字段卡，'
+            f'其余仅显示一行摘要'
+            f'</div>'
+        )
+    else:
+        card_eligible_idx = None  # render all
+        size_note = ""
+
     list_html = ['<div class="op-list-row head">'
                  '<div class="ix">#</div>'
                  '<div class="nm">Operator</div>'
@@ -2709,8 +2941,15 @@ def _render_l3_layer(b: "Bundle", view_id: str, parent_seg_id: str,
         pct = (e.duration_us / layer_busy_us * 100) if layer_busy_us > 0 else 0
         stream = e.stream_id or "—"
         card_id = f"opcard-host-{view_id}-{i}"
+        renders_card = card_eligible_idx is None or i in card_eligible_idx
+        if renders_card:
+            chevron = '<div style="text-align:right;color:var(--muted);font-size:14px">▾</div>'
+            row_attrs = f' data-card-id="{card_id}"'
+        else:
+            chevron = '<div style="text-align:right;color:var(--muted);font-size:14px">—</div>'
+            row_attrs = ''
         list_html.append(
-            f'<div class="op-list-row" data-card-id="{card_id}">'
+            f'<div class="op-list-row"{row_attrs}>'
             f'<div class="ix">{i+1}</div>'
             f'<div class="nm" title="{html.escape(e.name)}">{html.escape(short_op_name(e.name))}</div>'
             f'<div><span class="badge" style="background:{color}33;color:{color}">{html.escape(op_type)}</span></div>'
@@ -2718,22 +2957,23 @@ def _render_l3_layer(b: "Bundle", view_id: str, parent_seg_id: str,
             f'<div class="num">{e.duration_us:.2f}</div>'
             f'<div class="num">{pct:.2f}%</div>'
             f'<div><span class="badge" style="background:{bf_color}33;color:{bf_color}">{html.escape(bf)}</span></div>'
-            '<div style="text-align:right;color:var(--muted);font-size:14px">▾</div>'
+            f'{chevron}'
             '</div>'
         )
-        list_html.append(
-            f'<div class="op-card-host hidden" id="{card_id}">'
-            + render_operator_card(
-                e, layer_busy_us,
-                card_id=f"opcard-{view_id}-{i}",
-                step_busy_us=step_busy_us,
-                kernel_layer_union_us=kernel_layer_union_us,
-                kernel_layer_count=kernel_layer_count,
-                kernel_step_union_us=kernel_step_union_us,
-                kernel_step_count=kernel_step_count,
+        if renders_card:
+            list_html.append(
+                f'<div class="op-card-host hidden" id="{card_id}">'
+                + render_operator_card(
+                    e, layer_busy_us,
+                    card_id=f"opcard-{view_id}-{i}",
+                    step_busy_us=step_busy_us,
+                    kernel_layer_union_us=kernel_layer_union_us,
+                    kernel_layer_count=kernel_layer_count,
+                    kernel_step_union_us=kernel_step_union_us,
+                    kernel_step_count=kernel_step_count,
+                )
+                + '</div>'
             )
-            + '</div>'
-        )
 
     return (
         f'<section class="view" id="{view_id}" data-level="3" data-l2id="{l2_view}" '
@@ -2748,6 +2988,7 @@ def _render_l3_layer(b: "Bundle", view_id: str, parent_seg_id: str,
         '<div class="op-list">'
         + "".join(list_html) +
         '</div>'
+        + size_note
         + '</div>'
         '</section>'
     )

@@ -13,7 +13,7 @@ two ingredients:
 1. The scope's `structure_signature` (or, for blocks, the parent
    layer's structure_signature).  This is the human-readable layer
    period anchor string already produced by `segment.py`
-   (e.g. `anchors:attention.gqa_or_mha:fusedinferattentionscore|...`).
+   (e.g. `anchors:attention.flash_score:fusedinferattentionscore|...`).
 2. The **ordered list of `(normalized_op_name, shape_signature)`
    pairs** for events inside the scope that *carry* a `shape_signature`.
 
