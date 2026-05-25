@@ -64,7 +64,8 @@ for domain workflows.
 ## Repo-wide rules
 
 - Never write secrets, passwords, or tokens into tracked files.
-- Keep all local runtime state under `.vaws-local/` (untracked).
+- Keep VAWS runtime state under `.vaws-local/` and remote-dev endpoint/tool
+  state under `.remote-dev/state/`. Both are untracked.
 - Keep `.gitmodules` on community upstream URLs.
 - Prefer `.remote-dev` remote companion tools or skill wrapper scripts over raw SSH / shell commands for remote operations.
 - Skill wrappers: progress on `stderr`, final JSON on `stdout`.
