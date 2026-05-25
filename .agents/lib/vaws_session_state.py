@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable
 
 from vaws_local_state import ROOT, STATE_DIR, WorkspaceStateError, ensure_state_dir, utc_now_iso
 from vaws_session_id import load_current_session_binding, normalize_session_id
+from vaws_validate import parse_device_csv
 
 SESSION_SCHEMA_VERSION = 1
 INDEX_SCHEMA_VERSION = 1
@@ -291,19 +292,35 @@ def allocate_session_leases(
     session_id: str,
     requested_devices: list[int] | None = None,
     npu_count: int | None = None,
+    available_devices: list[int] | None = None,
     container_ssh_port: int | None = None,
     container_ssh_port_range: str = DEFAULT_CONTAINER_SSH_PORT_RANGE,
     port_available: Callable[[int], bool] | None = None,
 ) -> dict[str, Any]:
     sid = require_session_id(session_id)
+    if npu_count is not None and npu_count < 1:
+        raise SessionStateError("--npu-count must be >= 1")
+    if requested_devices is not None:
+        requested_devices = parse_device_csv(",".join(str(item) for item in requested_devices)) or []
+    if requested_devices is not None and npu_count is not None:
+        raise SessionStateError("use only one of --devices or --npu-count")
+    available_set = set(available_devices) if available_devices is not None else None
     with file_lock(session_lock_dir(repo_root) / "leases.lock"):
         leases = load_leases(repo_root)
         bucket = _machine_lease_bucket(leases, machine_alias)
         allocated_devices: list[int] = []
         if requested_devices is not None:
+            if available_set is not None:
+                missing = sorted(set(requested_devices) - available_set)
+                if missing:
+                    raise SessionStateError(
+                        f"requested NPU devices are not visible on host: {missing}; "
+                        f"available={sorted(available_set)}"
+                    )
             allocated_devices = list(requested_devices)
         elif npu_count:
-            for dev in range(64):
+            candidates = sorted(available_set) if available_set is not None else list(range(64))
+            for dev in candidates:
                 if _resource_owner(bucket, "npu_devices", str(dev)) in {None, sid}:
                     allocated_devices.append(dev)
                 if len(allocated_devices) >= npu_count:

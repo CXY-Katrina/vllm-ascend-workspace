@@ -45,6 +45,7 @@ PROGRESS_SENTINEL = '__VAWS_PARITY_PROGRESS__='
 STATE_LOCK_SUFFIX = '.lock'
 DEFAULT_STATE_LOCK_TIMEOUT_SECONDS = 15.0
 DEFAULT_STATE_LOCK_POLL_SECONDS = 0.05
+DEFAULT_STATE_LOCK_STALE_SECONDS = 60 * 60 * 6
 
 
 @dataclass(frozen=True)
@@ -175,16 +176,30 @@ def state_lock(
     *,
     timeout_seconds: float = DEFAULT_STATE_LOCK_TIMEOUT_SECONDS,
     poll_seconds: float = DEFAULT_STATE_LOCK_POLL_SECONDS,
+    stale_after_seconds: float = DEFAULT_STATE_LOCK_STALE_SECONDS,
 ):
     lock_path = canonical_state_path(repo_root, filename + STATE_LOCK_SUFFIX)
     deadline = time.monotonic() + timeout_seconds
+    owner = {
+        "pid": os.getpid(),
+        "hostname": os.uname().nodename if hasattr(os, "uname") else None,
+        "created_at": now_utc(),
+    }
     fd: int | None = None
     while True:
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(fd, f'{os.getpid()}\n'.encode('utf-8'))
+            os.write(fd, (json.dumps(owner, sort_keys=True) + "\n").encode('utf-8'))
             break
         except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age >= stale_after_seconds:
+                with contextlib.suppress(FileNotFoundError):
+                    lock_path.unlink()
+                continue
             if time.monotonic() >= deadline:
                 raise RuntimeError(f'timed out waiting for state lock {lock_path}')
             time.sleep(poll_seconds)

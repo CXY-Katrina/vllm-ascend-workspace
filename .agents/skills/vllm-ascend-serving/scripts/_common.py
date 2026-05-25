@@ -30,6 +30,7 @@ from vaws_remote_toolbox import (  # noqa: E402
     resolve_remote_target,
 )
 from vaws_session_state import session_serving_state_path  # noqa: E402
+from vaws_validate import parse_device_csv  # noqa: E402
 
 SERVING_STATE_DIR = ROOT / ".vaws-local" / "serving"
 PROGRESS_SENTINEL = "__VAWS_SERVING_PROGRESS__="
@@ -314,7 +315,14 @@ def select_devices(
     busy: dict[str, list] = npu_info.get("busy", {})
 
     if requested_devices is not None:
-        requested = [int(d.strip()) for d in requested_devices.split(",")]
+        requested = parse_device_csv(requested_devices) or []
+        visible = set(npu_info.get("devices", []))
+        missing = [d for d in requested if d not in visible]
+        if missing:
+            return None, (
+                f"requested devices {missing} are not visible on host; "
+                f"visible={sorted(visible)}"
+            )
         conflicts = [d for d in requested if str(d) in busy]
         if conflicts:
             details = {
@@ -324,7 +332,7 @@ def select_devices(
                 f"requested devices {conflicts} are busy: {json.dumps(details)}; "
                 f"free devices: {free}"
             )
-        return requested_devices, None
+        return ",".join(str(d) for d in requested), None
 
     if tp is None:
         return None, None

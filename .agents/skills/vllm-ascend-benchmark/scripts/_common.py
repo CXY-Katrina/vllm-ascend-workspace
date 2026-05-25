@@ -19,6 +19,7 @@ if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
 from vaws_session_state import load_session_lookup  # noqa: E402
+from vaws_validate import require_env_name  # noqa: E402
 
 SERVING_SCRIPTS = ROOT / ".agents" / "skills" / "vllm-ascend-serving" / "scripts"
 NIGHTLY_CONFIGS_DIR = (
@@ -349,12 +350,14 @@ def assemble_config(
     # --- Env: merge nightly base + user overrides ---
     env: dict[str, str] = {}
     if nightly_ref:
-        env.update(nightly_ref.envs)
+        for key, value in nightly_ref.envs.items():
+            env[require_env_name(key)] = value
     if extra_env:
         for item in extra_env:
-            if "=" in item:
-                k, v = item.split("=", 1)
-                env[k] = v
+            if "=" not in item:
+                raise ValueError(f"bad --extra-env {item!r}, expected KEY=VALUE")
+            k, v = item.split("=", 1)
+            env[require_env_name(k)] = v
     cfg.env = env
 
     return cfg

@@ -25,6 +25,14 @@ def print_json(data: dict[str, Any]) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def tail_output(value: str | bytes | None, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return value[-limit:]
+
+
 def ssh_check(host: str, port: int, user: str = "root", script: str = "true") -> dict[str, Any]:
     cmd = [
         "ssh",
@@ -41,16 +49,27 @@ def ssh_check(host: str, port: int, user: str = "root", script: str = "true") ->
         "-c",
         shlex.quote(script),
     ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=SSH_CHECK_TIMEOUT_SECONDS,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=SSH_CHECK_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "returncode": None,
+            "timed_out": True,
+            "timeout_seconds": SSH_CHECK_TIMEOUT_SECONDS,
+            "stdout_tail": tail_output(exc.stdout),
+            "stderr_tail": tail_output(exc.stderr),
+        }
     return {
         "ok": result.returncode == 0,
         "returncode": result.returncode,
+        "timed_out": False,
         "stdout_tail": result.stdout[-500:],
         "stderr_tail": result.stderr[-500:],
     }

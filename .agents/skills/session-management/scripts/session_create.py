@@ -40,6 +40,7 @@ from vaws_session_state import (  # noqa: E402
     session_record_for_execution,
 )
 from vaws_local_state import load_profile, utc_now_iso  # noqa: E402
+from vaws_validate import ValidationError, parse_device_csv  # noqa: E402
 
 PROGRESS_SENTINEL = "__VAWS_SESSION_PROGRESS__="
 PORT_TAIL_RE = re.compile(r"[:.]([0-9]+)$")
@@ -54,6 +55,14 @@ def emit_progress(phase: str, message: str, **extra: Any) -> None:
 
 def print_json(data: dict[str, Any]) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def tail_output(value: str | bytes | None, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return value[-limit:]
 
 
 def run_git(args: list[str], *, cwd: Path = ROOT, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -81,16 +90,47 @@ def load_machine(identifier: str) -> dict[str, Any]:
     return matches[0]
 
 
-def parse_devices(value: str | None) -> list[int] | None:
-    if value is None:
-        return None
-    devices: list[int] = []
-    for item in value.split(","):
-        stripped = item.strip()
-        if not stripped:
-            continue
-        devices.append(int(stripped))
-    return devices
+def parse_host_npu_devices(stdout: str) -> list[int]:
+    devices: set[int] = set()
+    for line in stdout.splitlines():
+        match = re.match(r"\|\s*(\d+)\s+\d*\w+\d+\w*\s+\|", line)
+        if match:
+            devices.add(int(match.group(1)))
+    return sorted(devices)
+
+
+def probe_host_npu_devices(record: dict[str, Any]) -> tuple[list[int] | None, dict[str, Any]]:
+    host = record["host"]
+    target = machine_ops.SshTarget(
+        host=host["ip"],
+        user=host.get("user", "root"),
+        port=host.get("port", 22),
+    )
+    cmd = [
+        *machine_ops.ssh_command(target),
+        "bash",
+        "-c",
+        shlex.quote("npu-smi info 2>/dev/null"),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        return None, {
+            "status": "timeout",
+            "timeout_seconds": 30,
+            "stdout_tail": tail_output(exc.stdout),
+            "stderr_tail": tail_output(exc.stderr),
+        }
+    payload: dict[str, Any] = {
+        "returncode": result.returncode,
+        "stderr_tail": result.stderr[-500:],
+    }
+    if result.returncode != 0:
+        payload["status"] = "unavailable"
+        return None, payload
+    devices = parse_host_npu_devices(result.stdout)
+    payload.update({"status": "ok" if devices else "unparsed", "devices": devices})
+    return devices or None, payload
 
 
 def host_port_available(record: dict[str, Any]) -> Any:
@@ -315,6 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    session_path: Path | None = None
+    binding_payload: dict[str, Any] | None = None
     try:
         resolved = resolve_session_id(
             explicit=args.session_id,
@@ -338,8 +380,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
                 return 0
-            except Exception:
-                pass
+            except SessionStateError as exc:
+                if "session id or session file is required" not in str(exc) and "session file does not exist" not in str(exc):
+                    print_json({"status": "needs_repair", "session_id": sid, "error": str(exc)})
+                    return 1
 
         emit_progress("resolve-machine", f"loading base machine {args.machine}")
         base_record = load_machine(args.machine)
@@ -354,6 +398,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_root = args.runtime_root or workdir
         branch = args.branch or default_branch(sid)
         worktree_root = args.worktree_root or default_worktree_root(ROOT, sid)
+        requested_devices = parse_device_csv(args.devices)
+        if requested_devices is not None and args.npu_count is not None:
+            raise SessionStateError("use only one of --devices or --npu-count")
+        if args.npu_count is not None and args.npu_count < 1:
+            raise SessionStateError("--npu-count must be >= 1")
+        available_devices, npu_probe = probe_host_npu_devices(base_record)
+        if available_devices is None:
+            emit_progress("probe-npus", "host NPU device probe unavailable; validating syntax only", **npu_probe)
+        else:
+            emit_progress("probe-npus", "host NPU device probe succeeded", devices=available_devices)
 
         local_root, worktree_payload = ensure_worktree(
             session_id=sid,
@@ -362,14 +416,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             worktree_root=worktree_root,
             no_worktree=args.no_worktree,
         )
+        if args.no_worktree and args.session_id:
+            binding_payload = {
+                "action": "skipped",
+                "reason": "explicit --no-worktree session does not overwrite repo-root current-session",
+                "path": str(local_root / ".vaws-local" / "current-session.json"),
+            }
+        else:
+            binding_path = write_current_session_binding(
+                local_root,
+                session_id=sid,
+                source="session_create-staging",
+                base_repo_root=ROOT,
+            )
+            binding_payload = {"action": "written", "path": str(binding_path)}
 
         emit_progress("lease", "allocating session resources", machine=alias)
         leases = allocate_session_leases(
             repo_root=ROOT,
             machine_alias=alias,
             session_id=sid,
-            requested_devices=parse_devices(args.devices),
+            requested_devices=requested_devices,
             npu_count=args.npu_count,
+            available_devices=available_devices,
             container_ssh_port=args.container_ssh_port,
             container_ssh_port_range=args.container_ssh_port_range,
             port_available=host_port_availability(base_record),
@@ -420,14 +489,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "created_at": now,
             "updated_at": now,
         }
+        if npu_probe:
+            session["leases"]["npu_probe"] = npu_probe
         session_path = save_session(session, repo_root=ROOT)
-        if args.no_worktree and args.session_id:
-            binding_payload = {
-                "action": "skipped",
-                "reason": "explicit --no-worktree session does not overwrite repo-root current-session",
-                "path": str(local_root / ".vaws-local" / "current-session.json"),
-            }
-        else:
+        if binding_payload and binding_payload.get("action") == "written":
             binding_path = write_current_session_binding(
                 local_root,
                 session_id=sid,
@@ -525,10 +590,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         return 0
+    except ValidationError as exc:
+        if "sid" in locals():
+            with contextlib.suppress(Exception):
+                release_all_session_leases(repo_root=ROOT, session_id=sid)
+        print_json({"status": "needs_input", "error": str(exc)})
+        return 1
     except Exception as exc:
         if "sid" in locals():
             with contextlib.suppress(Exception):
                 release_all_session_leases(repo_root=ROOT, session_id=sid)
+            if session_path is not None:
+                with contextlib.suppress(Exception):
+                    failed_session = load_session_lookup(session_file=session_path, repo_root=ROOT).session
+                    failed_session["status"] = "failed"
+                    failed_session["failure"] = {"error": str(exc)}
+                    save_session(failed_session, repo_root=ROOT)
         print_json({"status": "failed", "error": str(exc)})
         return 2
 

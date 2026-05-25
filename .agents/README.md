@@ -18,6 +18,7 @@ This directory contains the repository-local skill layer for Codex, Claude Code,
 - `.agents/lib/vaws_local_state.py` is the shared library for untracked local runtime state.
 - `.agents/lib/vaws_session_id.py` and `.agents/lib/vaws_session_state.py` are the shared libraries for session identity, state, locks, and leases.
 - `.agents/lib/vaws_remote_toolbox.py` is the shared library for remote target resolution, SSH execution, job observation, artifact streaming, sync adapters, service adapters, and cleanup.
+- `.agents/lib/vaws_validate.py` is the shared validation library for agent-facing ids, environment names, path boundaries, and NPU device lists.
 - `AGENTS.md` carries repository-wide routing rules and mandatory decision gates.
 
 ## Script-first convention
@@ -81,6 +82,7 @@ Current primary helpers:
 - `ascend-profiling-analysis/scripts/profile_analyze.py`
 - `ascend-profiling-analysis/scripts/profile_sweep.py`
 - `scripts/workspace_profile.py`
+- `.agents/tests/test_vaws_scaffold_safety.py`
 
 Low-level machine-management helpers remain available for implementation work and debugging:
 
@@ -155,6 +157,8 @@ If you change `remote-toolbox`, update these together:
 - `.agents/scripts/remote_*.py`
 - `.agents/lib/vaws_remote_toolbox.py`
 - affected wrapper scripts that reuse toolbox primitives
+- `.agents/lib/vaws_validate.py` when changing accepted id, env, path, or device syntax
+- `.agents/tests/test_vaws_scaffold_safety.py` when changing safety validation behavior
 - `AGENTS.md`, `README.md`, and this file when routing or output contracts change
 
 If you change `vllm-ascend-serving`, update these together:

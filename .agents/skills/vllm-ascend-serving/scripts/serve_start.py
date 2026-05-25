@@ -56,6 +56,7 @@ from _common import (
     ssh_exec,
 )
 from vaws_session_state import allocate_service_port, file_lock, release_service_port, session_lock_dir
+from vaws_validate import parse_device_csv, require_env_name
 
 RUNTIME_DIR_BASE = ".vaws-runtime/serving"
 DEFAULT_HEALTH_TIMEOUT = 300
@@ -198,12 +199,9 @@ def remote_port_availability(ep: SshEndpoint):
 
 
 def _parse_devices_csv(value: str) -> set[int]:
-    devices: set[int] = set()
-    for token in value.split(","):
-        stripped = token.strip()
-        if stripped:
-            devices.add(int(stripped))
-    return devices
+    if not value or not value.strip():
+        return set()
+    return set(parse_device_csv(value) or [])
 
 
 def _leased_devices_csv(session: dict[str, Any] | None) -> str | None:
@@ -269,7 +267,8 @@ def build_launch_script(
         lines.append(f"export ASCEND_RT_VISIBLE_DEVICES={shlex.quote(devices)}")
 
     for key, value in extra_env.items():
-        lines.append(f"export {key}={shlex.quote(value)}")
+        name = require_env_name(key)
+        lines.append(f"export {name}={shlex.quote(value)}")
 
     # Launch from the runtime dir — NOT from /vllm-workspace, which would
     # shadow the installed vllm package with the source tree.
@@ -640,7 +639,11 @@ def main(argv: list[str] | None = None) -> int:
                 print_json({"status": "failed", "error": f"bad --extra-env {item!r}, expected KEY=VALUE"})
                 return 1
             k, _, v = item.partition("=")
-            extra_env[k.strip()] = v
+            try:
+                extra_env[require_env_name(k.strip())] = v
+            except ValueError as exc:
+                print_json({"status": "needs_input", "error": str(exc)})
+                return 1
 
         # ---- resolve launch params (fresh or relaunch) ----
         if args.relaunch:
@@ -690,7 +693,11 @@ def main(argv: list[str] | None = None) -> int:
 
         leased_devices = _leased_devices_csv(target.session)
         if target.session_id and leased_devices:
-            leased = _parse_devices_csv(leased_devices)
+            try:
+                leased = _parse_devices_csv(leased_devices)
+            except ValueError as exc:
+                print_json({"status": "needs_repair", "error": str(exc), "session_id": target.session_id})
+                return 1
             needed_devices = tp * (dp or 1) if tp is not None else None
             if needed_devices is not None and len(leased) < needed_devices:
                 print_json({
@@ -705,7 +712,11 @@ def main(argv: list[str] | None = None) -> int:
                 })
                 return 1
             if devices:
-                requested = _parse_devices_csv(devices)
+                try:
+                    requested = _parse_devices_csv(devices)
+                except ValueError as exc:
+                    print_json({"status": "needs_input", "error": str(exc)})
+                    return 1
                 if not requested.issubset(leased):
                     print_json({
                         "status": "needs_input",
@@ -837,9 +848,13 @@ def main(argv: list[str] | None = None) -> int:
             emit_progress("probe-npus", f"NPU probe failed (non-fatal): {exc}")
 
         if npu_info is not None:
-            resolved_devices, device_error = select_devices(
-                npu_info, requested_devices=devices, tp=tp, dp=dp,
-            )
+            try:
+                resolved_devices, device_error = select_devices(
+                    npu_info, requested_devices=devices, tp=tp, dp=dp,
+                )
+            except ValueError as exc:
+                print_json({"status": "needs_input", "error": str(exc), "npu_info": npu_info})
+                return 1
             if device_error:
                 print_json({
                     "status": "needs_input",

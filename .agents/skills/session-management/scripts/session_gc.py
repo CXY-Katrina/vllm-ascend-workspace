@@ -14,7 +14,7 @@ LIB_DIR = ROOT / ".agents" / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-from vaws_session_state import load_index, load_session_lookup, release_all_session_leases  # noqa: E402
+from vaws_session_state import load_index, load_leases, load_session_lookup, release_all_session_leases  # noqa: E402
 
 
 def print_json(data: dict[str, Any]) -> None:
@@ -38,19 +38,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def lease_owner_session_ids(leases: dict[str, Any]) -> set[str]:
+    owners: set[str] = set()
+    for bucket in leases.get("leases", {}).values():
+        if not isinstance(bucket, dict):
+            continue
+        for kind in ("npu_devices", "container_ssh_ports", "service_ports"):
+            records = bucket.get(kind, {})
+            if not isinstance(records, dict):
+                continue
+            for record in records.values():
+                if isinstance(record, dict) and isinstance(record.get("session_id"), str):
+                    owners.add(record["session_id"])
+    return owners
+
+
 def main() -> int:
     args = build_parser().parse_args()
     dry_run = not args.apply
     try:
         index = load_index(ROOT)
+        leases = load_leases(ROOT)
         released: list[str] = []
         checked: list[dict[str, Any]] = []
-        for sid in sorted(index.get("sessions", {})):
+        active: list[str] = []
+        candidates = set(index.get("sessions", {})) | lease_owner_session_ids(leases)
+        for sid in sorted(candidates):
             try:
                 lookup = load_session_lookup(session_id=sid, repo_root=ROOT)
                 session = lookup.session
             except Exception as exc:  # noqa: BLE001
-                checked.append({"session_id": sid, "status": "missing-state", "error": str(exc)})
+                state = "orphan-lease" if sid not in index.get("sessions", {}) else "missing-state"
+                checked.append({"session_id": sid, "status": state, "error": str(exc)})
                 if not dry_run:
                     release_all_session_leases(repo_root=ROOT, session_id=sid)
                 released.append(sid)
@@ -59,12 +78,15 @@ def main() -> int:
                 if not dry_run:
                     release_all_session_leases(repo_root=lookup.state_repo_root, session_id=sid)
                 released.append(sid)
+            else:
+                active.append(sid)
             checked.append({"session_id": sid, "status": session.get("status")})
         print_json(
             {
                 "status": "ok",
                 "dry_run": dry_run,
                 "checked": checked,
+                "active_session_leases": sorted(set(active) & lease_owner_session_ids(leases)),
                 "released_lease_sessions": [] if dry_run else sorted(set(released)),
                 "would_release_lease_sessions": sorted(set(released)) if dry_run else [],
             }

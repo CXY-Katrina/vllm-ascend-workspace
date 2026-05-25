@@ -45,6 +45,13 @@ from vaws_session_state import (  # noqa: E402
     session_record_for_execution,
     session_serving_state_path,
 )
+from vaws_validate import (  # noqa: E402
+    ValidationError,
+    ensure_child_path,
+    require_env_name,
+    require_remote_leaf,
+    require_safe_id,
+)
 
 
 PROGRESS_SENTINEL = "__VAWS_REMOTE_TOOLBOX_PROGRESS__="
@@ -422,9 +429,8 @@ def ssh_exec_bytes(
 def _remote_env_exports(env: dict[str, str]) -> list[str]:
     lines: list[str] = []
     for key, value in sorted(env.items()):
-        if not key.replace("_", "").isalnum() or key[0].isdigit():
-            raise RemoteToolboxError(f"invalid env var name: {key!r}")
-        lines.append(f"export {key}={shlex.quote(str(value))}")
+        name = require_env_name(key)
+        lines.append(f"export {name}={shlex.quote(str(value))}")
     return lines
 
 
@@ -795,16 +801,18 @@ def _parse_env_items(items: Sequence[str] | None) -> dict[str, str]:
         if "=" not in item:
             raise RemoteToolboxError(f"bad env item {item!r}; expected KEY=VALUE")
         key, value = item.split("=", 1)
-        env[key] = value
+        env[require_env_name(key)] = value
     return env
 
 
 def _remote_job_dir(target: RemoteTarget, job_id: str) -> str:
-    return str(PurePosixPath(target.remote_toolbox_root()) / "jobs" / job_id)
+    safe_job_id = require_remote_leaf(job_id, label="job id")
+    return str(PurePosixPath(target.remote_toolbox_root()) / "jobs" / safe_job_id)
 
 
 def _job_record_path(job_id: str) -> Path:
-    return JOB_STATE_DIR / f"{job_id}.json"
+    safe_job_id = require_safe_id(job_id, label="job id")
+    return ensure_child_path(JOB_STATE_DIR, JOB_STATE_DIR / f"{safe_job_id}.json")
 
 
 def _save_job_record(job_id: str, record: dict[str, Any]) -> None:
@@ -831,7 +839,10 @@ def start_remote_job(
 ) -> dict[str, Any]:
     started_at = now_iso()
     start = time.monotonic()
-    job_id = job_id or f"job-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    job_id = require_safe_id(
+        job_id or f"job-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}",
+        label="job id",
+    )
     remote_dir = _remote_job_dir(target, job_id)
     cwd = cwd or target.runtime_root
     env = env or {}
@@ -923,7 +934,11 @@ printf '{{"pid":%s}}\\n' "$pid"
 
 
 def _resolve_job_target(job_id: str, args: argparse.Namespace | None = None) -> tuple[RemoteTarget, dict[str, Any]]:
+    job_id = require_safe_id(job_id, label="job id")
     record = _load_job_record(job_id)
+    record_job_id = require_safe_id(str(record.get("job_id", "")), label="job id")
+    if record_job_id != job_id:
+        raise RemoteToolboxError(f"job record id mismatch: requested {job_id!r}, record has {record_job_id!r}")
     if args and (getattr(args, "machine", None) or getattr(args, "session_id", None) or getattr(args, "session_file", None)):
         target = resolve_remote_target(
             machine=getattr(args, "machine", None),
@@ -1333,12 +1348,17 @@ def _artifact_pull_tar_batch(
 
 
 def _local_manifest(local_path: Path) -> dict[str, Any]:
-    local_path = local_path.expanduser().resolve()
+    raw_path = local_path.expanduser()
+    if raw_path.is_symlink():
+        raise RemoteToolboxError("symlinks are not allowed by artifact_push")
+    local_path = raw_path.resolve()
     if not local_path.exists():
         raise RemoteToolboxError(f"local path does not exist: {local_path}")
     files: list[dict[str, Any]] = []
     roots = [local_path] if local_path.is_file() else sorted(p for p in local_path.rglob("*") if p.is_file())
     for path in roots:
+        if path.is_symlink():
+            raise RemoteToolboxError(f"symlinks are not allowed by artifact_push: {path}")
         relpath = "." if path == local_path else str(path.relative_to(local_path))
         files.append({
             "relpath": relpath,
@@ -1732,16 +1752,27 @@ def cleanup(
     started_at = now_iso()
     start = time.monotonic()
     actions: list[dict[str, Any]] = []
+    status = "ok"
+    service_release_ok = False
     if service:
         if dry_run:
             actions.append({"action": "service-stop", "dry_run": True})
+            service_release_ok = True
         else:
-            actions.append({"action": "service-stop", "result": call_service("stop", target, ["--force"] if force else [])})
+            service_result = call_service("stop", target, ["--force"] if force else [])
+            actions.append({"action": "service-stop", "result": service_result})
+            service_release_ok = (
+                service_result.get("returncode") == 0
+                and service_result.get("status") in {"stopped", "not_found"}
+            )
     if jobs or remote_temp:
         remote_paths = []
         if jobs:
             if job_ids:
-                remote_paths.extend(str(PurePosixPath(target.remote_toolbox_root()) / "jobs" / job_id) for job_id in job_ids)
+                remote_paths.extend(
+                    str(PurePosixPath(target.remote_toolbox_root()) / "jobs" / require_remote_leaf(job_id, label="job id"))
+                    for job_id in job_ids
+                )
             else:
                 remote_paths.append(str(PurePosixPath(target.remote_toolbox_root()) / "jobs"))
         if remote_temp:
@@ -1767,8 +1798,24 @@ def cleanup(
             rc, payload, stdout, stderr = _run_json_command(cmd, relay_stderr=True)
             actions.append({"action": "session-remove", "returncode": rc, "result": payload, "stdout_tail": tail_text(stdout), "stderr_tail": tail_text(stderr)})
     elif leases and target.session_id:
-        if dry_run:
+        if not service:
+            actions.append({
+                "action": "release-leases",
+                "session_id": target.session_id,
+                "blocked": True,
+                "reason": "lease release requires --service, --session-container, or --all for session targets",
+            })
+            status = "blocked"
+        elif dry_run:
             actions.append({"action": "release-leases", "session_id": target.session_id, "dry_run": True})
+        elif not service_release_ok:
+            actions.append({
+                "action": "release-leases",
+                "session_id": target.session_id,
+                "blocked": True,
+                "reason": "service stop did not prove resources are safe to release",
+            })
+            status = "blocked"
         else:
             release_all_session_leases(repo_root=target.state_repo_root, session_id=target.session_id)
             actions.append({"action": "release-leases", "session_id": target.session_id, "released": True})
@@ -1791,7 +1838,7 @@ def cleanup(
         with contextlib.suppress(Exception):
             proof["leases"] = load_leases(target.state_repo_root)
     return {
-        "status": "ok",
+        "status": status,
         "target": target.to_dict(),
         "started_at": started_at,
         "duration_ms": duration_ms(start),
@@ -1819,7 +1866,7 @@ def target_from_args(args: argparse.Namespace) -> RemoteTarget:
 
 def _cli_error(exc: BaseException, *, started_at: str, start: float) -> int:
     status = "failed"
-    if isinstance(exc, (RemoteToolboxError, WorkspaceStateError, FileNotFoundError)):
+    if isinstance(exc, (RemoteToolboxError, WorkspaceStateError, ValidationError, FileNotFoundError)):
         status = "needs_input"
     if isinstance(exc, subprocess.TimeoutExpired):
         status = "timeout"
@@ -1887,11 +1934,12 @@ def cli_exec(argv: Sequence[str] | None = None) -> int:
             command = " ".join(command_args)
         if not command:
             raise RemoteToolboxError("--command or command after -- is required")
+        env = _parse_env_items(args.env)
         payload = remote_exec(
             target_from_args(args),
             command=command,
             cwd=args.cwd,
-            env=_parse_env_items(args.env),
+            env=env,
             timeout=args.timeout,
             runtime_env=not args.no_runtime_env,
         )
@@ -1919,14 +1967,16 @@ def cli_job_start(argv: Sequence[str] | None = None) -> int:
     started_at = now_iso()
     start = time.monotonic()
     try:
+        env = _parse_env_items(args.env)
+        job_id = require_safe_id(args.job_id, label="job id") if args.job_id else None
         print_json(start_remote_job(
             target_from_args(args),
             command=args.command,
             cwd=args.cwd,
-            env=_parse_env_items(args.env),
+            env=env,
             kind=args.kind,
             timeout_seconds=args.timeout,
-            job_id=args.job_id,
+            job_id=job_id,
             runtime_env=not args.no_runtime_env,
         ))
         return 0
@@ -2162,6 +2212,8 @@ def cli_cleanup(argv: Sequence[str] | None = None) -> int:
     started_at = now_iso()
     start = time.monotonic()
     try:
+        for job_id in args.job_id:
+            require_safe_id(job_id, label="job id")
         if args.job_id:
             args.jobs = True
         if args.all:
@@ -2183,6 +2235,6 @@ def cli_cleanup(argv: Sequence[str] | None = None) -> int:
             force=args.force,
         )
         print_json(payload)
-        return 0
+        return 0 if payload["status"] == "ok" else 1
     except Exception as exc:  # noqa: BLE001
         return _cli_error(exc, started_at=started_at, start=start)
