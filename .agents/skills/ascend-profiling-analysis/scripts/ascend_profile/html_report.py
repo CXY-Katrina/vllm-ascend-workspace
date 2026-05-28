@@ -725,14 +725,14 @@ def class_color(family, step_class_id):
 def load_csv(path: Path):
     if not path.exists():
         return []
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
 def load_json(path: Path):
     if not path.exists():
         return None
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -813,7 +813,7 @@ def _load_events(path: Path) -> list:
     if not path.exists():
         return []
     events = []
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         for row in csv.DictReader(f):
             try:
                 pipe = json.loads(row.get("pipeline_us") or "{}")
@@ -849,7 +849,7 @@ def _load_raw_kernel_details(root: Path) -> dict:
     si_path = root / "source_index.json"
     if not si_path.exists():
         return {}
-    si = json.loads(si_path.read_text())
+    si = json.loads(si_path.read_text(encoding="utf-8"))
     sources = si.get("sources", []) if isinstance(si, dict) else si
     by_source = {}
     for s in sources:
@@ -863,7 +863,7 @@ def _load_raw_kernel_details(root: Path) -> dict:
             continue
         rows = []
         try:
-            with path.open() as f:
+            with path.open(encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for r in reader:
                     rows.append(r)

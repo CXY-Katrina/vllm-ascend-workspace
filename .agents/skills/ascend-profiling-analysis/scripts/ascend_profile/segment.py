@@ -387,8 +387,10 @@ def group_layer_anchors(anchors: Sequence[NormalizedEvent], boundary_rows: Seque
     """Group same-layer anchors without using timing gaps.
 
     Multiple attention-like kernels can belong to one layer only when no
-    visible block/normalization boundary sits between them.  Otherwise every
-    anchor starts a new layer observation.
+    visible block_head boundary sits between them.  Normalization-only events
+    (l2norm / layer_norm / rms_norm) can appear within a single attention
+    block in recurrent models and must not split the anchor group.  Only
+    block_head (AddRmsNormBias etc.) signals a true layer boundary.
     """
 
     groups: list[tuple[NormalizedEvent, ...]] = []
@@ -409,11 +411,11 @@ def group_layer_anchors(anchors: Sequence[NormalizedEvent], boundary_rows: Seque
     return groups
 
 
-def build_layers(events: Sequence[NormalizedEvent], row_numbers: Sequence[int], boundary_rows: Sequence[int], selection_rows: Sequence[int]) -> list[LayerObservation]:
+def build_layers(events: Sequence[NormalizedEvent], row_numbers: Sequence[int], boundary_rows: Sequence[int], anchor_boundary_rows: Sequence[int], selection_rows: Sequence[int]) -> list[LayerObservation]:
     anchors = layer_anchor_events(events)
     if not anchors:
         return []
-    anchor_groups = group_layer_anchors(anchors, boundary_rows)
+    anchor_groups = group_layer_anchors(anchors, anchor_boundary_rows)
     starts: list[int] = []
     for index, group in enumerate(anchor_groups):
         lower_bound = events[0].row_idx if index == 0 else anchor_groups[index - 1][-1].row_idx + 1
@@ -451,41 +453,60 @@ def split_coarse_layers_by_moe(
 ) -> list[LayerObservation]:
     """Refine coarse attention observations with MoE anchors.
 
-    If one attention observation encloses multiple MoE anchors, attention is not
-    the layer-frequency evidence for that window.  The deterministic repair is
-    to split that local window by MoE anchors while preserving the attention
-    rows as evidence inside the first refined layer.
+    If one attention observation encloses multiple MoE anchors that are separated
+    by a block_head boundary, attention is not the layer-frequency evidence for
+    that window.  The deterministic repair is to split by those boundary-separated
+    MoE anchor groups.  Consecutive MoE anchors within the same MoE block (e.g.
+    gating + expert_matmul) stay grouped when no boundary sits between them.
     """
 
     refined: list[LayerObservation] = []
     for layer in layers:
         layer_events = event_slice(events, row_numbers, layer.row_start, layer.row_end)
-        moe_anchors = list(dedup_adjacent_events(tuple(event for event in layer_events if event_role(event, "moe") and primary_moe_category(event))))
-        if len(moe_anchors) <= 1:
+        raw_moe_anchors = list(dedup_adjacent_events(tuple(event for event in layer_events if event_role(event, "moe") and primary_moe_category(event))))
+        if len(raw_moe_anchors) <= 1:
+            refined.append(layer)
+            continue
+        # Group consecutive MoE anchors that are not separated by a boundary.
+        # Anchors within one MoE block (gating, expert_matmul_1, expert_matmul_2, ...)
+        # share the same group; a boundary between anchor *i-1* and anchor *i* starts
+        # a new group.
+        moe_groups: list[tuple[NormalizedEvent, ...]] = []
+        current_group: list[NormalizedEvent] = [raw_moe_anchors[0]]
+        for idx in range(1, len(raw_moe_anchors)):
+            prev = raw_moe_anchors[idx - 1]
+            cur = raw_moe_anchors[idx]
+            if has_row_between(boundary_rows, prev.row_idx, cur.row_idx):
+                moe_groups.append(tuple(current_group))
+                current_group = [cur]
+            else:
+                current_group.append(cur)
+        moe_groups.append(tuple(current_group))
+        if len(moe_groups) <= 1:
             refined.append(layer)
             continue
         starts: list[int] = []
-        for index, anchor in enumerate(moe_anchors):
+        for index, group in enumerate(moe_groups):
             if index == 0:
                 starts.append(layer.row_start)
                 continue
-            lower_bound = moe_anchors[index - 1].row_idx + 1
-            selection_pos = bisect.bisect_left(selection_rows, anchor.row_idx)
+            lower_bound = moe_groups[index - 1][-1].row_idx + 1
+            selection_pos = bisect.bisect_left(selection_rows, group[0].row_idx)
             if selection_pos > 0 and selection_rows[selection_pos - 1] >= lower_bound:
                 lower_bound = selection_rows[selection_pos - 1] + 1
-            start = latest_row_at_or_before(boundary_rows, anchor.row_idx, lower_bound)
-            starts.append(start if start is not None else anchor.row_idx)
-        for index, anchor in enumerate(moe_anchors):
+            start = latest_row_at_or_before(boundary_rows, group[0].row_idx, lower_bound)
+            starts.append(start if start is not None else group[0].row_idx)
+        for index, group in enumerate(moe_groups):
             row_start = starts[index]
             row_end = starts[index + 1] - 1 if index + 1 < len(starts) else layer.row_end
             sub_events = event_slice(events, row_numbers, row_start, row_end)
-            signature = layer_structure_signature(sub_events, (anchor,))
+            signature = layer_structure_signature(sub_events, group)
             refined.append(
                 LayerObservation(
                     index=len(refined),
                     row_start=row_start,
                     row_end=row_end,
-                    anchors=(anchor,),
+                    anchors=group,
                     signature=signature,
                     regime_key=layer_regime_key(signature),
                 )
@@ -2652,8 +2673,12 @@ def build_segments_for_rank(rank_id: str, events: Sequence[NormalizedEvent]) -> 
         events,
         lambda event: event_role(event, "block_head") or event_role(event, "normalization"),
     )
+    anchor_boundary_rows = dedup_adjacent_event_rows(
+        events,
+        lambda event: event_role(event, "block_head"),
+    )
     selection_rows = dedup_adjacent_event_rows(events, lambda event: event_role(event, "selection"))
-    layers_observed = build_layers(events, row_numbers, boundary_rows, selection_rows)
+    layers_observed = build_layers(events, row_numbers, boundary_rows, anchor_boundary_rows, selection_rows)
     evidence: list[EvidenceRef] = []
     segments: list[StepSegment] = []
     layer_segments: list[LayerSegment] = []
